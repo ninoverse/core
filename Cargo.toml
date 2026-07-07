@@ -4,23 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-actix-web = "4.10.2"
-chrono = "0.4.40"
-dotenv = "0.15.0"
-futures = "0.3.31"
-http = "1.3.1"
-httparse = "1.10.1"
-ouroboros = "0.18.5"
-# polars = { version = "0.46.0", features = ["full"] }
-rand = "0.9.0"
-rdkafka = { version = "0.37", features = ["cmake-build"] }
-serde = "1.0.219"
-serde_json = "1.0.140"
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
-thiserror = "2.0.12"
-tokio = { version = "1", features = [
+tokio = { version = "1.52.3", features = [
     "macros",
     "rt-multi-thread",
-    "sync",
-    "time",
+    # "sync",
+    # "time",
 ] }
+chrono = "0.4.45"
+config = "0.15.25"
+serde = { version = "1.0.228", features = ["derive"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "migrate"] }
+rdkafka = { version = "0.39", features = ["cmake-build"] }
+futures = "0.3.32"
+actix-web = "4.14.0"
+thiserror = "2.0.18"
+

@@ -8,7 +8,7 @@ services:
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://broker:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:9093
@@ -27,31 +27,35 @@ services:
     environment:
       - POSTGRES_USER=nino
       - POSTGRES_PASSWORD=nino
-      - POSTGRES_DB=ninoverse
+    #   - POSTGRES_DB=ninoverse
     volumes:
-      - ./sql:/docker-entrypoint-initdb.d
-      - ./postgres-data:/var/lib/postgresql/data
+      - postgres-data-ninoverse:/var/lib/postgresql
     ports:
       - "5432:5432"
     networks:
       - ninoverse-network
 
-  ninoverse:
-    image: ninoverse:0.0.1
-    ports:
-      - "3000:7878"
-    environment:
-      - SELF_PORT=7878
-      - PG_HOST=postgres
-      - PG_PORT=5432
-      - PG_USER=nino
-      - PG_PASSWORD=nino
-      - PG_DB=ninoverse
-      - KAFKA_BROKER=broker:9092
-      - KAFKA_TOPIC=ninoverse:1:1
-    networks:
-      - ninoverse-network
+  # ninoverse:
+  #   image: ninoverse:0.0.1
+  #   ports:
+  #     - "3000:7878"
+  #   environment:
+  #     - APP__PORT=7878
+  #     - APP__HOST=localhost
+  #     - APP__DATABASE__HOST=postgres
+  #     - APP__DATABASE__PORT=5432
+  #     - APP__DATABASE__USER=nino
+  #     - APP__DATABASE__PASSWORD=nino
+  #     - APP__DATABASE__DATABASE=ninoverse
+  #     - APP__DATABASE__POOL_SIZE=25
+  #     - APP__KAFKA__BROKER=broker:9092
+  #     - APP__KAFKA__TOPICS=ninoverse:1:1
+  #   networks:
+  #     - ninoverse-network
 
 networks:
   ninoverse-network:
     driver: bridge
+
+volumes:
+  postgres-data-ninoverse:
