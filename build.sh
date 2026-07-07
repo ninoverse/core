@@ -46,7 +46,8 @@ line
 line
 message "Building the project..."
 # docker build -t ninoverse:$VERSION --progress=plain . 2>&1 | tee $LOG_FILE_NAME
-docker build -t ninoverse:$VERSION --progress=plain . > $LOG_FILE_NAME 2>&1
+# docker build -t ninoverse:$VERSION --progress=plain . > $LOG_FILE_NAME 2>&1
+docker build -t ninoverse:$VERSION .
 line
 
 # Exit if the build encountered an error
