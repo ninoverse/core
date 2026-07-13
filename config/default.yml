@@ -15,3 +15,8 @@ kafka:
   group_id: "ninoverse"
   topics:
     - "ninoverse:1:1"
+
+docker:
+  remove_containers_on_shutdown: true
+  remove_volumes_on_shutdown: false
+  remove_networks_on_shutdown: false

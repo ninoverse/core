@@ -45,12 +45,20 @@ pub struct KafkaTopic {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DockerConfiguration {
+    pub remove_containers_on_shutdown: bool,
+    pub remove_volumes_on_shutdown: bool,
+    pub remove_networks_on_shutdown: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Configuration {
     #[allow(dead_code)]
     pub host: String,
     pub port: u16,
     pub database: PostgresDatabaseConfiguration,
     pub kafka: KafkaBrokerConfiguration,
+    pub docker: DockerConfiguration
 }
 
 impl Configuration {
