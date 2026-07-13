@@ -105,7 +105,7 @@ async fn init_kafka_topics(
     admin_client: AdminClient<KafkaBrokerContext>,
     app_configuration: &Configuration,
 ) {
-    debug!(["TOPIC_CREATION"], "Creating topics object.");
+    info!(["TOPIC_CREATION"], "Creating topics object.");
     let kafka_topics = &app_configuration.kafka.topics;
     let kafka_new_topics: Vec<NewTopic<'_>> = kafka_topics
         .iter()
@@ -118,7 +118,7 @@ async fn init_kafka_topics(
         .collect();
 
     if kafka_new_topics.is_empty() {
-        debug!(
+        info!(
             ["TOPIC_CREATION"],
             "No topic created (no topic creation configured)."
         );
@@ -126,7 +126,7 @@ async fn init_kafka_topics(
     }
 
     let options = AdminOptions::new();
-    debug!(["TOPIC_CREATION"], "Sending request to Kafka Admin Client");
+    info!(["TOPIC_CREATION"], "Sending request to Kafka Admin Client");
     match admin_client
         .create_topics(&kafka_new_topics, &options)
         .await
@@ -134,7 +134,7 @@ async fn init_kafka_topics(
         Ok(topic_created_list) => {
             for topic_creation_result in topic_created_list {
                 match topic_creation_result {
-                    Ok(topic) => debug!(["TOPIC_CREATION"], "{}", topic),
+                    Ok(topic) => info!(["TOPIC_CREATION"], "Topic {}' created", topic),
                     Err((topic, error_code)) => match error_code {
                         RDKafkaErrorCode::TopicAlreadyExists => {
                             warn!(["TOPIC_CREATION"], "Topic '{}' already exists", topic)
