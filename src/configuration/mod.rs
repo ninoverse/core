@@ -11,6 +11,7 @@ pub struct PostgresDatabaseConfiguration {
     pub user: String,
     pub password: String,
     pub pool_size: u32,
+    pub connection_attempt: u32,
 }
 
 impl fmt::Debug for PostgresDatabaseConfiguration {

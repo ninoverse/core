@@ -3,11 +3,12 @@ port: 7878
 
 database:
   host: "localhost"
-  port: "5432" 
+  port: "5432"
   name: "ninoverse"
   user: "nino"
   password: "nino"
   pool_size: 25
+  connection_attempt: 5
 
 kafka:
   broker: "localhost:9092"
