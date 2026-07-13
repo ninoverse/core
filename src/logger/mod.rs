@@ -1,10 +1,10 @@
 use chrono::Local;
+use std::fmt;
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::fmt;
 
-use crate::debug;
+use crate::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(dead_code)]
@@ -19,8 +19,8 @@ impl fmt::Display for LogLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let level_str = match self {
             LogLevel::Debug => "DEBUG",
-            LogLevel::Info  => "INFO",
-            LogLevel::Warn  => "WARN",
+            LogLevel::Info => "INFO",
+            LogLevel::Warn => "WARN",
             LogLevel::Error => "ERROR",
         };
         write!(f, "{}", level_str)
@@ -39,7 +39,7 @@ pub fn init() {
     let (log_sender, log_receiver) = mpsc::channel::<LogMessage>();
 
     if LOG_SENDER.set(log_sender).is_err() {
-        debug!(["LOGGER"], "Warning: Logger was already initialized.");
+        warn!(["LOGGER"], "Warning: Logger was already initialized.");
         return;
     }
 
@@ -93,19 +93,15 @@ pub fn log(message: &str, level: LogLevel, decorator: Option<Vec<String>>) {
 
 #[macro_export]
 macro_rules! debug {
-    // 1. Decorator array + plain string
     ([$($dec:expr),*], $msg:expr) => {
         $crate::logger::log($msg, $crate::logger::LogLevel::Debug, Some(vec![$($dec.to_string()),*]))
     };
-    // 2. Decorator array + formatted string
     ([$($dec:expr),*], $msg:expr, $($arg:tt)*) => {
         $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Debug, Some(vec![$($dec.to_string()),*]))
     };
-    // 3. No decorator + plain string
     ($msg:expr) => {
         $crate::logger::log($msg, $crate::logger::LogLevel::Debug, None)
     };
-    // 4. No decorator + formatted string
     ($msg:expr, $($arg:tt)*) => {
         $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Debug, None)
     };
