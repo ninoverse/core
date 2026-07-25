@@ -1,2 +1,13 @@
 /target
 .tmp
+
+# generated analysis reports
+/clippy-report.json
+/lcov.info
+/.scannerwork
+
+# SonarQube token (never commit)
+sonarqube/.sonar-token
+
+# editor
+.vscode/
