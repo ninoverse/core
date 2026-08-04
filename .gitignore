@@ -1,5 +1,6 @@
 /target
 .tmp
+**/*.rs.bk
 
 # generated analysis reports
 /clippy-report.json

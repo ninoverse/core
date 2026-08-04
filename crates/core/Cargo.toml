@@ -1,0 +1,24 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2024"
+default-run = "core"
+
+[dependencies]
+tokio = { version = "1.52.3", features = [
+    "macros",
+    "rt-multi-thread",
+    # "sync",
+    # "time",
+] }
+chrono = "0.4.45"
+config = "0.15.25"
+serde = { version = "1.0.228", features = ["derive"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "migrate"] }
+rdkafka = { version = "0.39", features = ["cmake-build"] }
+futures = "0.3.32"
+actix-web = "4.14.0"
+thiserror = "2.0.18"
+serde_yaml = "0.9.34"
+bollard = "0.21.0"
+futures-util = "0.3.32"

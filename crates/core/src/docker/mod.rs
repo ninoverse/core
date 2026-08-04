@@ -37,7 +37,8 @@ pub struct ServiceConfig {
     pub volumes: Option<Vec<String>>,
     pub environment: Option<Vec<String>>,
     pub container_name: Option<String>,
-    pub command: Option<Vec<String>>
+    pub command: Option<Vec<String>>,
+    pub user: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -65,6 +66,37 @@ pub enum DockerModuleError {
     Bollard(#[from] bollard::errors::Error),
 }
 
+fn resolve_bind_source(bind_spec: &str) -> Result<String, DockerModuleError> {
+    let (source, rest) = match bind_spec.split_once(':') {
+        Some((source, rest)) => (source, Some(rest)),
+        None => (bind_spec, None),
+    };
+
+    let resolved_source = if !source.contains('/') || source.starts_with('/') {
+        source.to_string()
+    } else {
+        let joined = std::env::current_dir()?.join(source);
+        match fs::canonicalize(&joined) {
+            Ok(canonical) => canonical.to_string_lossy().into_owned(),
+            Err(canonicalize_error) => {
+                warn!(
+                    ["DOCKER_INIT"],
+                    "Could not resolve bind source [{}]: {}. Using [{}] as-is.",
+                    source,
+                    canonicalize_error,
+                    joined.display()
+                );
+                joined.to_string_lossy().into_owned()
+            }
+        }
+    };
+
+    Ok(match rest {
+        Some(rest) => format!("{}:{}", resolved_source, rest),
+        None => resolved_source,
+    })
+}
+
 pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModuleError> {
     let compose_file_dir = Path::new("containers");
     let mut definitions = DockerDefinitions::default();
@@ -87,6 +119,11 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                                 if let Some(ref mut nets) = config.networks {
                                     for net in nets.iter_mut() {
                                         *net = format!("{}", net);
+                                    }
+                                }
+                                if let Some(ref mut volumes) = config.volumes {
+                                    for volume in volumes.iter_mut() {
+                                        *volume = resolve_bind_source(volume)?;
                                     }
                                 }
                                 definitions.services.push((unique_name, config));
@@ -206,7 +243,8 @@ pub async fn start_docker_container(
     docker_services: Vec<(String, ServiceConfig)>,
     docker: &Docker,
     shutdown_broadcast_sender: & Sender<()>,
-    join_set: &mut JoinSet<()>
+    join_set: &mut JoinSet<()>,
+    remove_containers_on_shutdown: bool,
 ) -> Result<(), DockerModuleError> {
     let barrier = Arc::new(Barrier::new(docker_services.len() + 1));
 
@@ -260,6 +298,8 @@ pub async fn start_docker_container(
 
             let command = service_config.command.unwrap_or_default();
 
+            let user = service_config.user.unwrap_or_default();
+
             let container_configuration = ContainerCreateBody {
                 image: service_config.image.clone(),
                 host_config: Some(host_config),
@@ -268,6 +308,7 @@ pub async fn start_docker_container(
                 }),
                 env: Some(environment),
                 cmd: Some(command),
+                user: Some(user),
                 ..Default::default()
             };
 
@@ -423,13 +464,17 @@ pub async fn start_docker_container(
                         match docker_cloned.stop_container(&service_name, Some(stop_options)).await {
                             Ok(_) => {
                                 info!(["DOCKER_SHUTDOWN"], "Container '{}' stopped gracefully.", &service_name);
-                                let remove_container_options = RemoveContainerOptionsBuilder::default()
-                                    .force(true)
-                                    .build();
-                                match docker_cloned.remove_container(&service_name, Some(remove_container_options)).await {
-                                    Ok(_) => info!(["DOCKER_SHUTDOWN"], "Container '{}' removed.", service_name),
-                                    Err(remove_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to remove '{}': {}", service_name, remove_container_error),
-                                };
+                                if remove_containers_on_shutdown {
+                                    let remove_container_options = RemoveContainerOptionsBuilder::default()
+                                        .force(true)
+                                        .build();
+                                    match docker_cloned.remove_container(&service_name, Some(remove_container_options)).await {
+                                        Ok(_) => info!(["DOCKER_SHUTDOWN"], "Container '{}' removed.", service_name),
+                                        Err(remove_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to remove '{}': {}", service_name, remove_container_error),
+                                    };
+                                } else {
+                                    info!(["DOCKER_SHUTDOWN"], "Container '{}' left in place (remove_containers_on_shutdown=false).", &service_name);
+                                }
                             },
                             Err(stop_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to stop '{}': {}", service_name, stop_container_error),
                         }

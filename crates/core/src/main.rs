@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &docker,
         &shutdown_broadcast_sender,
         &mut join_set,
+        app_configuration.docker.remove_containers_on_shutdown,
     )
     .await?;
     info!(["MAIN"], "Initializing DB pool");
