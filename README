@@ -1,0 +1,149 @@
+# ninoverse `core`
+
+Rust orchestrator for the `ninoverse` home infrastructure: on startup it reads
+compose-style YAML definitions, stands up the required Docker networks,
+volumes and containers, and initializes a Postgres pool with migrations.
+Kafka and HTTP layers exist in the codebase but are not yet wired into the
+running binary (see [Status](#status)).
+
+## What it does
+
+1. Loads configuration (`config/default.yml` + `APP__*` env overrides).
+2. Connects to the Docker daemon and parses every `containers/*.yaml` file.
+3. Creates the declared networks and volumes, then pulls images and starts
+   the declared containers, tracking them in a `JoinSet` for graceful
+   shutdown on `Ctrl+C`.
+4. Connects to Postgres with retry/backoff and runs the SQL migrations in
+   `sql/`.
+5. Waits for `Ctrl+C`, then broadcasts shutdown and stops the containers it
+   started (per `docker.remove_containers_on_shutdown` in config).
+
+## Status
+
+`src/main.rs` only wires up `configuration`, `docker`, `db_handler`,
+and `logger`. `kafka_handler` and `web_server` (actix-web) are implemented
+but their entry points (`init_kafka`, `init_request_handler`) are not yet
+called — the intended `run_threads` wiring is commented out. `http_handler`
+(a hand-rolled HTTP request/response parser) exists on disk but isn't
+declared as a module and isn't compiled in at all.
+
+## Workspace layout
+
+Cargo workspace, single member today:
+
+| Path | Contents |
+|------|----------|
+| `Cargo.toml` | Workspace root. `members = ["crates/*"]`, shared `[workspace.package]`. |
+| `crates/core/` | The `core` binary crate (`ninoverse`'s orchestrator). |
+| `crates/core/src/configuration/` | `config`-crate based settings loader (YAML + env). |
+| `crates/core/src/docker/` | Parses `containers/*.yaml`, drives `bollard` to create networks/volumes/containers. |
+| `crates/core/src/db_handler/` | Postgres pool (`sqlx`) + migration runner. |
+| `crates/core/src/kafka_handler/` | `rdkafka` producer/consumer/admin helpers (not yet started from `main`). |
+| `crates/core/src/web_server/` | `actix-web` HTTP API (not yet started from `main`). |
+| `crates/core/src/http_handler/` | Standalone request/response (de)serializer, currently unused. |
+| `crates/core/src/logger/` | Custom async logger (`info!`/`warn!`/`error!`/`debug!` macros over an mpsc channel). |
+| `crates/core/config/` | `default.yml` plus config for the local infra stack (`haproxy.cfg`, `tempo.yaml`, `vector.yaml`). |
+| `crates/core/containers/` | One compose-style YAML per service/group; parsed at startup. |
+| `crates/core/sql/` | Numbered migrations run against the `database.name` in config. |
+| `bin/` | `Dockerfile` + `build.sh` for packaging the binary as a container image. |
+| `sonarqube/` | Self-hosted SonarQube `Dockerfile` + `scan.sh` (see [Code quality](#code-quality)). |
+
+## Local infrastructure stack
+
+`containers/*.yaml` files declare everything `core` brings up on the shared
+`ninoverse-network`:
+
+| File | Service(s) | Purpose |
+|------|-----------|---------|
+| `services.yaml` | `broker`, `postgres` | Kafka broker (KRaft, single node) and the app's Postgres instance. |
+| `networks.yaml` | `ninoverse-network` | Shared bridge network for every container. |
+| `volumes.yaml` | — | Named volumes for every stateful service below. |
+| `haproxy.yaml` | `haproxy` | TLS-terminating router in front of Postgres and the OTLP ingest ports. |
+| `sftp.yaml` | `sftp` | SFTP server backed by `ninoverse-sftp-data`. |
+| `sonarqube.yaml` | `sonarqube` | Self-hosted SonarQube (community branch plugin), against a `sonarqube` DB on the same Postgres. |
+| `logs_vector.yaml` | `vector` | Collects Docker logs + OTLP traffic, fans out to the logging backends below. |
+| `logs_tempo.yaml` | `tempo` | Trace storage, OTLP receiver. |
+| `logs_grafana.yaml`, `logs_loki.yaml`, `logs_mimir.yaml`, `logs_openobserve.yaml`, `logs_opensearch.yaml`, `logs_elasticsearch.yaml`, `logs_signoz.yaml`, `logs_victorialogs.yaml` | — | Alternative logging/observability backends kept side by side for evaluation. |
+
+## Configuration
+
+`Configuration::build()` (`crates/core/src/configuration/mod.rs`) layers:
+
+1. `config/default.yml`, resolved **relative to the process's working
+   directory** — run cargo from `crates/core/`, or the file source is
+   silently skipped (`required(false)`) and every field must come from
+   the environment instead.
+2. Environment variables prefixed `APP__`, `__`-separated for nesting,
+   e.g. `APP__DATABASE__HOST`, `APP__KAFKA__GROUP_ID`.
+   `kafka.topics` is a comma-separated list of `name:num_partition:offset`
+   entries, e.g. `APP__KAFKA__TOPICS=ninoverse:1:1,other-topic:3:0`.
+
+## Running it
+
+Prerequisites:
+
+- A reachable Docker daemon (`docker` socket) — `core` creates and starts
+  containers on startup.
+- The pinned Rust toolchain (`rust-toolchain.toml` pulls it automatically on
+  first `cargo` invocation).
+
+```bash
+cd crates/core
+cargo run                    # loads config/default.yml relative to this dir
+```
+
+`Ctrl+C` triggers a graceful shutdown: the broadcast channel fires, spawned
+container-supervisor tasks are joined, and (per config) started containers
+are removed.
+
+## Daily commands
+
+```bash
+cargo build --workspace                                                # Build all crates
+cargo watch -x 'check --workspace'                                     # Dev loop (requires cargo-watch)
+cargo build --workspace --release                                      # Release build
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # Lint
+cargo fmt --all                                                        # Format (check-only: `cargo fmt --all -- --check`)
+cargo nextest run --workspace                                          # Tests (fallback: cargo test --workspace)
+cargo deny check                                                       # Licenses + advisories
+cargo audit                                                            # CVE check
+```
+
+Install the auxiliary tools once per machine:
+
+```bash
+cargo install --locked cargo-nextest cargo-watch cargo-deny cargo-audit
+```
+
+## Code quality
+
+`sonar-project.properties` + `sonarqube/scan.sh` drive a self-hosted
+SonarQube scan (`sonarqube.yaml` above): the script generates a clippy JSON
+report and an `lcov.info` on the host, then runs the containerized scanner
+against them, tagging the analysis with the current git branch. Requires a
+token in `sonarqube/.sonar-token` (gitignored) or `$SONAR_TOKEN`.
+
+## Container image
+
+`bin/Dockerfile` and `bin/build.sh` build a release binary in a
+`rust:bullseye` stage and copy it into a `debian:bullseye-slim` runtime
+image, then `docker-compose up` it. Both still reference the pre-workspace
+binary name (`ninoverse`); update them to the `core` package path if you
+rely on this path.
+
+## Rule files
+
+| File | Purpose |
+|------|---------|
+| `.claude/branch-naming.md` | Branch prefix and format conventions |
+| `.claude/commit-conventions.md` | Conventional Commits rules |
+| `.claude/pr-guidelines.md` | PR title, description template, size guidance |
+| `.claude/testing-requirements.md` | Test gates (fmt, clippy, nextest, deny) |
+| `.claude/file-naming.md` | Workspace and per-crate layout |
+| `.claude/code-review.md` | Review checklist (lint, error handling, unsafe, docs, deps) |
+| `.claude/crate-workflow.md` | Step-by-step procedure to add a crate |
+| `.claude/execution-order.md` | Branching strategy for crate groups |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
