@@ -1,0 +1,10 @@
+services:
+  sftp:
+    image: atmoz/sftp
+    container_name: sftp-server
+    volumes:
+      - ninoverse-sftp-data:/home/sftpuser/upload
+    command: 
+      - sftpuser:pass:1000:1000:upload
+    networks:
+      - ninoverse-network

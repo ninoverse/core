@@ -1,0 +1,11 @@
+services:
+  vector:
+    image: timberio/vector:latest-alpine
+    container_name: vector
+    restart: unless-stopped
+    volumes:
+      - config/vector.yaml:/etc/vector/vector.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - vector-data:/var/lib/vector
+    networks:
+      - ninoverse-network

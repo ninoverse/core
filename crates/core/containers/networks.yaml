@@ -1,0 +1,3 @@
+networks:
+  ninoverse-network:
+    driver: bridge

@@ -1,0 +1,14 @@
+services:
+  mimir:
+    image: grafana/mimir:latest
+    container_name: mimir
+    command:
+      - "-blocks-storage.filesystem.dir=/data/blocks"
+      - "-blocks-storage.tsdb.dir=/data/tsdb"
+      - "-ruler-storage.filesystem.dir=/data/ruler"
+      - "-alertmanager-storage.filesystem.dir=/data/alertmanager"
+      - "-compactor.data-dir=/data/compactor-data"
+    volumes:
+      - mimir-data:/data
+    networks:
+      - ninoverse-network

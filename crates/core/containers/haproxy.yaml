@@ -1,0 +1,13 @@
+services:
+  haproxy:
+    image: haproxy:latest
+    container_name: haproxy_router
+    ports:
+      - "80:80"
+      - "443:443"
+      - "5432:5432"
+    volumes:
+      - config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - /home/nino/ninoverse/cert/nicolapasqualini.cert.pem:/etc/haproxy/certs/nicolapasqualini.cert.pem
+    networks:
+      - ninoverse-network

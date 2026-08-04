@@ -1,0 +1,12 @@
+services:
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_INSTALL_PLUGINS=victoriametrics-logs-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - ninoverse-network

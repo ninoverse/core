@@ -1,0 +1,11 @@
+services:
+  # opensearch:
+  #   image: opensearchproject/opensearch:latest
+  #   container_name: opensearch
+  #   environment:
+  #     - discovery.type=single-node
+  #     - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+  #     - DISABLE_INSTALL_DEMO_CONFIG=true
+  #     - plugins.security.disabled=true # Disabled for easy local testing
+  #   networks:
+  #     - ninoverse-network
