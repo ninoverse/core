@@ -64,7 +64,10 @@ pub struct Configuration {
 impl Configuration {
     pub fn build() -> Result<Self, ConfigError> {
         let builder = Config::builder()
-            .add_source(File::with_name("config/default").required(false))
+            .add_source(
+                File::with_name(concat!(env!("CARGO_MANIFEST_DIR"), "/config/default"))
+                    .required(false),
+            )
             .add_source(
                 Environment::with_prefix("APP")
                     .try_parsing(true)

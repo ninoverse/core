@@ -75,7 +75,7 @@ fn resolve_bind_source(bind_spec: &str) -> Result<String, DockerModuleError> {
     let resolved_source = if !source.contains('/') || source.starts_with('/') {
         source.to_string()
     } else {
-        let joined = std::env::current_dir()?.join(source);
+        let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
         match fs::canonicalize(&joined) {
             Ok(canonical) => canonical.to_string_lossy().into_owned(),
             Err(canonicalize_error) => {
@@ -98,7 +98,7 @@ fn resolve_bind_source(bind_spec: &str) -> Result<String, DockerModuleError> {
 }
 
 pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModuleError> {
-    let compose_file_dir = Path::new("containers");
+    let compose_file_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/containers"));
     let mut definitions = DockerDefinitions::default();
 
     if compose_file_dir.exists() && compose_file_dir.is_dir() {
