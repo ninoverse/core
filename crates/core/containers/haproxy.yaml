@@ -8,6 +8,6 @@ services:
       - "5432:5432"
     volumes:
       - config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - /home/nino/ninoverse/cert/nicolapasqualini.cert.pem:/etc/haproxy/certs/nicolapasqualini.cert.pem
+      - /home/nino/ninoverse/certs/nicolapasqualini.it.pem:/etc/haproxy/certs/nicolapasqualini.it.pem
     networks:
       - ninoverse-network

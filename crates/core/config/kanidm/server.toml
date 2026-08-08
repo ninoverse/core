@@ -1,0 +1,18 @@
+# The server configuration file version
+version = "2"
+
+# The webserver bind address
+bindaddress = "0.0.0.0:8443"
+
+# The core domain of your identity system (e.g., your base domain)
+domain = "nicolapasqualini.it"
+
+# The absolute URL of the subdomain you are routing through HAProxy
+origin = "https://auth.nicolapasqualini.it"
+
+# Database storage path (inside the container)
+db_path = "/data/kanidm.db"
+
+# TLS Certificates (These must be available in the /certs folder)
+tls_chain = "/certs/chain.pem"
+tls_key = "/certs/key.pem"

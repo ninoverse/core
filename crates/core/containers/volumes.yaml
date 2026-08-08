@@ -7,5 +7,6 @@ volumes:
   openobserve-data:
   victorialogs-data:
   kafka-data:
+  kanidm-data:
   tempo-data:
   vector-data:
