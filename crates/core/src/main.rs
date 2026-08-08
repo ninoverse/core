@@ -44,8 +44,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-    let (shutdown_broadcast_sender, _) = broadcast::channel::<()>(1);
+    let (shutdown_broadcast_sender, mut shutdown_receiver) = broadcast::channel::<()>(1);
     let mut join_set = JoinSet::<()>::new();
+
+    let ctrl_c_shutdown_sender = shutdown_broadcast_sender.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            info!(["MAIN"], "\nCtrl+C detected! Initiating shutdown...");
+            let _ = ctrl_c_shutdown_sender.send(());
+        }
+    });
+
     info!(["MAIN"], "Creating docker client");
     let docker = create_docker_client().await?;
     info!(["MAIN"], "Searching docker containers definitions");
@@ -65,19 +74,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     info!(["MAIN"], "Initializing DB pool");
-    let _pool = db_handler::init_db(&app_configuration).await?;
-    info!(["MAIN"], "Starting threads");
-    // run_threads(pool, app_configuration).await?;
-    info!(["MAIN"], "Orchestrator running, press Ctrl+C to stop.");
-    tokio::signal::ctrl_c().await?;
-    info!(["MAIN"], "\nCtrl+C detected! Initiating shutdown...");
+    let db_pool_result = tokio::select! {
+        _ = shutdown_receiver.recv() => None,
+        db_pool_result = db_handler::init_db(&app_configuration) => Some(db_pool_result),
+    };
+
+    let mut startup_error = None;
+    match db_pool_result {
+        None => info!(["MAIN"], "Shutdown requested during startup, skipping run phase."),
+        Some(Err(db_pool_error)) => startup_error = Some(db_pool_error),
+        Some(Ok(_pool)) => {
+            info!(["MAIN"], "Starting threads");
+            // run_threads(pool, app_configuration).await?;
+            info!(["MAIN"], "Orchestrator running, press Ctrl+C to stop.");
+            let _ = shutdown_receiver.recv().await;
+        }
+    }
+
     let _ = shutdown_broadcast_sender.send(());
+
+    info!(["MAIN"], "Waiting for containers to stop...");
     while let Some(res) = join_set.join_next().await {
         if let Err(e) = res {
             error!(["MAIN"], "A spawned task panicked during shutdown: {}", e);
         }
     };
-    Ok(())
+
+    match startup_error {
+        Some(startup_error) => Err(startup_error.into()),
+        None => Ok(()),
+    }
 }
 
 // async fn run_threads(

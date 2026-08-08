@@ -239,6 +239,46 @@ pub async fn create_docker_volumes(
     Ok(())
 }
 
+async fn stop_and_cleanup_container(
+    docker: &Docker,
+    service_name: &str,
+    remove_containers_on_shutdown: bool,
+) {
+    if docker
+        .inspect_container(service_name, None::<InspectContainerOptions>)
+        .await
+        .is_err()
+    {
+        info!(
+            ["DOCKER_SHUTDOWN"],
+            "Container '{}' was never created; nothing to stop.", service_name
+        );
+        return;
+    }
+
+    let stop_options = StopContainerOptions {
+        signal: Some("SIGTERM".to_string()),
+        t: Some(10),
+    };
+    match docker.stop_container(service_name, Some(stop_options)).await {
+        Ok(_) => {
+            info!(["DOCKER_SHUTDOWN"], "Container '{}' stopped gracefully.", service_name);
+            if remove_containers_on_shutdown {
+                let remove_container_options = RemoveContainerOptionsBuilder::default()
+                    .force(true)
+                    .build();
+                match docker.remove_container(service_name, Some(remove_container_options)).await {
+                    Ok(_) => info!(["DOCKER_SHUTDOWN"], "Container '{}' removed.", service_name),
+                    Err(remove_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to remove '{}': {}", service_name, remove_container_error),
+                };
+            } else {
+                info!(["DOCKER_SHUTDOWN"], "Container '{}' left in place (remove_containers_on_shutdown=false).", service_name);
+            }
+        },
+        Err(stop_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to stop '{}': {}", service_name, stop_container_error),
+    }
+}
+
 pub async fn start_docker_container(
     docker_services: Vec<(String, ServiceConfig)>,
     docker: &Docker,
@@ -247,6 +287,7 @@ pub async fn start_docker_container(
     remove_containers_on_shutdown: bool,
 ) -> Result<(), DockerModuleError> {
     let barrier = Arc::new(Barrier::new(docker_services.len() + 1));
+    let mut startup_shutdown_receiver = shutdown_broadcast_sender.subscribe();
 
     for (service_name, service_config) in docker_services {
         let barrier_cloned = barrier.clone();
@@ -254,164 +295,21 @@ pub async fn start_docker_container(
         let mut shutdown_broadcast_sender_subscribed = shutdown_broadcast_sender.subscribe();
 
         join_set.spawn(async move {
-            info!(
-                ["DOCKER_INIT"],
-                "Booting up service: {} (Image: {:?})", service_name, service_config.image
-            );
-
-            let mut host_config = HostConfig::default();
-
-            if let Some(volumes) = &service_config.volumes {
-                host_config.binds = Some(volumes.clone());
-            }
-
-            if let Some(ports) = &service_config.ports {
-                let mut port_bindings = HashMap::new();
-                for port_mapping in ports {
-                    let parts: Vec<&str> = port_mapping.split(':').collect();
-                    if parts.len() == 2 {
-                        let host_port = parts[0].to_string();
-                        let container_port = format!("{}/tcp", parts[1]);
-
-                        port_bindings.insert(
-                            container_port,
-                            Some(vec![PortBinding {
-                                host_ip: Some("0.0.0.0".to_string()),
-                                host_port: Some(host_port),
-                            }]),
-                        );
-                    }
-                }
-                host_config.port_bindings = Some(port_bindings);
-            }
-
-            let mut network_endpoints = HashMap::new();
-            if let Some(networks) = &service_config.networks {
-                for net in networks {
-                    network_endpoints.insert(net.clone(), EndpointSettings::default());
-                }
-            }
-
-            let environment = service_config.environment.unwrap_or_default();
-
-            let _container_name = service_config.container_name.unwrap_or_default();
-
-            let command = service_config.command.unwrap_or_default();
-
-            let user = service_config.user.unwrap_or_default();
-
-            let container_configuration = ContainerCreateBody {
-                image: service_config.image.clone(),
-                host_config: Some(host_config),
-                networking_config: Some(NetworkingConfig {
-                    endpoints_config: Some(network_endpoints),
-                }),
-                env: Some(environment),
-                cmd: Some(command),
-                user: Some(user),
-                ..Default::default()
-            };
-
-            let create_options = CreateContainerOptions {
-                name: Some(service_name.clone()),
-                platform: String::new(),
-            };
-
-            if let Some(image_name) = &service_config.image {
-                info!(
-                    ["DOCKER_IMAGES"],
-                    "Checking image [{}] for service [{}]...", image_name, service_name
-                );
-
-                let pull_options = CreateImageOptions {
-                    from_image: Some(image_name.clone()),
-                    ..Default::default()
-                };
-
-                let mut image_stream = docker_cloned.create_image(Some(pull_options), None, None);
-
-                while let Some(update) = image_stream.next().await {
-                    match update {
-                        Ok(info) => {
-                            if let Some(status) = info.status {
-                                info!(
-                                    ["DOCKER_IMAGES"],
-                                    "Pulling image [{}] for service [{}]: {}",
-                                    image_name,
-                                    service_name,
-                                    status
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            panic!("Fatal error pulling image [{}]: {}", image_name, e);
-                        }
-                    }
-                }
-                info!(["DOCKER_INIT"], "Image [{}] is ready.", image_name);
-            }
-
-            match docker_cloned
-                .create_container(Some(create_options), container_configuration)
-                .await
-            {
-                Ok(_) => info!(
-                    ["DOCKER_INIT"],
-                    "Container [{}] created successfully.", &service_name
-                ),
-                Err(bollard::errors::Error::DockerResponseServerError { status_code, .. })
-                    if status_code == 409 =>
-                {
-                    warn!(
-                        ["DOCKER_INIT"],
-                        "Warning: Container [{}] exists, proceeding anyway...", &service_name
-                    );
-                }
-                Err(volume_creation_error) => {
-                    panic!(
-                        "Failed to create container [{}]: {}",
-                        service_name, volume_creation_error
-                    );
-                }
-            };
-
-            info!(["DOCKER_INIT"], "Starting container [{}].", &service_name);
-            match docker_cloned
-                .start_container(&service_name, None::<StartContainerOptions>)
-                .await
-            {
-                Ok(_) => {
+            tokio::select! {
+                _ = boot_service(&docker_cloned, &service_name, service_config) => {}
+                _ = shutdown_broadcast_sender_subscribed.recv() => {
                     info!(
-                        ["DOCKER_INIT"],
-                        "Container [{}] started successfully, waiting for healthy state.",
-                        &service_name
+                        ["DOCKER_SHUTDOWN"],
+                        "Shutdown signal received by task '{}' during startup. Aborting boot...",
+                        service_name
                     );
-                    loop {
-                        let inspect = docker_cloned
-                            .inspect_container(&service_name, None::<InspectContainerOptions>)
-                            .await
-                            .unwrap();
-                        if let Some(state) = inspect.state {
-                            if state.running.unwrap_or(false) {
-                                break;
-                            }
-                        }
-                        sleep(Duration::from_secs(1)).await;
-                    }
-                }
-                Err(bollard::errors::Error::DockerResponseServerError { status_code, .. })
-                    if status_code == 409 =>
-                {
-                    warn!(
-                        ["DOCKER_INIT"],
-                        "Warning: Container [{}] exists, proceeding anyway...", &service_name
-                    );
-                }
-                Err(volume_creation_error) => {
-                    panic!(
-                        "Failed to start container [{}]: {}",
-                        service_name, volume_creation_error
-                    );
+                    stop_and_cleanup_container(
+                        &docker_cloned,
+                        &service_name,
+                        remove_containers_on_shutdown,
+                    )
+                    .await;
+                    return;
                 }
             }
 
@@ -420,7 +318,23 @@ pub async fn start_docker_container(
                 "Service [{}] is started and healthy. Signaling barrier...", service_name
             );
 
-            barrier_cloned.wait().await;
+            tokio::select! {
+                _ = barrier_cloned.wait() => {}
+                _ = shutdown_broadcast_sender_subscribed.recv() => {
+                    info!(
+                        ["DOCKER_SHUTDOWN"],
+                        "Shutdown signal received by task '{}' while waiting at the barrier. Stopping container...",
+                        service_name
+                    );
+                    stop_and_cleanup_container(
+                        &docker_cloned,
+                        &service_name,
+                        remove_containers_on_shutdown,
+                    )
+                    .await;
+                    return;
+                }
+            }
 
             loop {
                 tokio::select! {
@@ -456,38 +370,198 @@ pub async fn start_docker_container(
                             }
                         }
                     }
-                    
+
                     _ = shutdown_broadcast_sender_subscribed.recv() => {
                         info!(["DOCKER_SHUTDOWN"], "Shutdown signal received by task '{}'. Stopping container...", service_name);
-                        
-                        let stop_options = StopContainerOptions { signal: Some("SIGTERM".to_string()), t: Some(10) };
-                        match docker_cloned.stop_container(&service_name, Some(stop_options)).await {
-                            Ok(_) => {
-                                info!(["DOCKER_SHUTDOWN"], "Container '{}' stopped gracefully.", &service_name);
-                                if remove_containers_on_shutdown {
-                                    let remove_container_options = RemoveContainerOptionsBuilder::default()
-                                        .force(true)
-                                        .build();
-                                    match docker_cloned.remove_container(&service_name, Some(remove_container_options)).await {
-                                        Ok(_) => info!(["DOCKER_SHUTDOWN"], "Container '{}' removed.", service_name),
-                                        Err(remove_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to remove '{}': {}", service_name, remove_container_error),
-                                    };
-                                } else {
-                                    info!(["DOCKER_SHUTDOWN"], "Container '{}' left in place (remove_containers_on_shutdown=false).", &service_name);
-                                }
-                            },
-                            Err(stop_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to stop '{}': {}", service_name, stop_container_error),
-                        }
-                        
+
+                        stop_and_cleanup_container(
+                            &docker_cloned,
+                            &service_name,
+                            remove_containers_on_shutdown,
+                        )
+                        .await;
+
                         break;
                     }
                 }
-                
+
             }
         });
     }
 
-    barrier.wait().await;
-    info!(["DOCKER_INIT"], "All Docker definitions are up");
+    tokio::select! {
+        _ = barrier.wait() => {
+            info!(["DOCKER_INIT"], "All Docker definitions are up");
+        }
+        _ = startup_shutdown_receiver.recv() => {
+            info!(
+                ["DOCKER_INIT"],
+                "Shutdown requested before all services were up. Skipping remaining startup."
+            );
+        }
+    }
     Ok(())
+}
+
+async fn boot_service(docker: &Docker, service_name: &str, service_config: ServiceConfig) {
+    info!(
+        ["DOCKER_INIT"],
+        "Booting up service: {} (Image: {:?})", service_name, service_config.image
+    );
+
+    let mut host_config = HostConfig::default();
+
+    if let Some(volumes) = &service_config.volumes {
+        host_config.binds = Some(volumes.clone());
+    }
+
+    if let Some(ports) = &service_config.ports {
+        let mut port_bindings = HashMap::new();
+        for port_mapping in ports {
+            let parts: Vec<&str> = port_mapping.split(':').collect();
+            if parts.len() == 2 {
+                let host_port = parts[0].to_string();
+                let container_port = format!("{}/tcp", parts[1]);
+
+                port_bindings.insert(
+                    container_port,
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_string()),
+                        host_port: Some(host_port),
+                    }]),
+                );
+            }
+        }
+        host_config.port_bindings = Some(port_bindings);
+    }
+
+    let mut network_endpoints = HashMap::new();
+    if let Some(networks) = &service_config.networks {
+        for net in networks {
+            network_endpoints.insert(net.clone(), EndpointSettings::default());
+        }
+    }
+
+    let environment = service_config.environment.unwrap_or_default();
+
+    let _container_name = service_config.container_name.unwrap_or_default();
+
+    let command = service_config.command.unwrap_or_default();
+
+    let user = service_config.user.unwrap_or_default();
+
+    let container_configuration = ContainerCreateBody {
+        image: service_config.image.clone(),
+        host_config: Some(host_config),
+        networking_config: Some(NetworkingConfig {
+            endpoints_config: Some(network_endpoints),
+        }),
+        env: Some(environment),
+        cmd: Some(command),
+        user: Some(user),
+        ..Default::default()
+    };
+
+    let create_options = CreateContainerOptions {
+        name: Some(service_name.to_string()),
+        platform: String::new(),
+    };
+
+    if let Some(image_name) = &service_config.image {
+        info!(
+            ["DOCKER_IMAGES"],
+            "Checking image [{}] for service [{}]...", image_name, service_name
+        );
+
+        let pull_options = CreateImageOptions {
+            from_image: Some(image_name.clone()),
+            ..Default::default()
+        };
+
+        let mut image_stream = docker.create_image(Some(pull_options), None, None);
+
+        while let Some(update) = image_stream.next().await {
+            match update {
+                Ok(info) => {
+                    if let Some(status) = info.status {
+                        info!(
+                            ["DOCKER_IMAGES"],
+                            "Pulling image [{}] for service [{}]: {}",
+                            image_name,
+                            service_name,
+                            status
+                        );
+                    }
+                }
+                Err(e) => {
+                    panic!("Fatal error pulling image [{}]: {}", image_name, e);
+                }
+            }
+        }
+        info!(["DOCKER_INIT"], "Image [{}] is ready.", image_name);
+    }
+
+    match docker
+        .create_container(Some(create_options), container_configuration)
+        .await
+    {
+        Ok(_) => info!(
+            ["DOCKER_INIT"],
+            "Container [{}] created successfully.", &service_name
+        ),
+        Err(bollard::errors::Error::DockerResponseServerError { status_code, .. })
+            if status_code == 409 =>
+        {
+            warn!(
+                ["DOCKER_INIT"],
+                "Warning: Container [{}] exists, proceeding anyway...", &service_name
+            );
+        }
+        Err(volume_creation_error) => {
+            panic!(
+                "Failed to create container [{}]: {}",
+                service_name, volume_creation_error
+            );
+        }
+    };
+
+    info!(["DOCKER_INIT"], "Starting container [{}].", &service_name);
+    match docker
+        .start_container(service_name, None::<StartContainerOptions>)
+        .await
+    {
+        Ok(_) => {
+            info!(
+                ["DOCKER_INIT"],
+                "Container [{}] started successfully, waiting for healthy state.",
+                &service_name
+            );
+            loop {
+                let inspect = docker
+                    .inspect_container(service_name, None::<InspectContainerOptions>)
+                    .await
+                    .unwrap();
+                if let Some(state) = inspect.state {
+                    if state.running.unwrap_or(false) {
+                        break;
+                    }
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(bollard::errors::Error::DockerResponseServerError { status_code, .. })
+            if status_code == 409 =>
+        {
+            warn!(
+                ["DOCKER_INIT"],
+                "Warning: Container [{}] exists, proceeding anyway...", &service_name
+            );
+        }
+        Err(volume_creation_error) => {
+            panic!(
+                "Failed to start container [{}]: {}",
+                service_name, volume_creation_error
+            );
+        }
+    }
 }
