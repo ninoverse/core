@@ -1,5 +1,5 @@
 use bollard::{
-    Docker, models::{NetworkCreateRequest, VolumeCreateRequest}, plugin::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, PortBinding}, query_parameters::{
+    Docker, models::{Mount, MountBindOptions, MountType, NetworkCreateRequest, VolumeCreateRequest}, plugin::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, PortBinding}, query_parameters::{
         CreateContainerOptions, CreateImageOptions, InspectContainerOptions, RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptions,
     },
 };
@@ -7,7 +7,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_yaml;
 use std::sync::Arc;
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, env, fs, path::{Component, Path, PathBuf}};
 use thiserror::Error;
 use tokio::{
    sync::{Barrier, broadcast::Sender}, task::JoinSet, time::{Duration, sleep},
@@ -34,11 +34,37 @@ pub struct ServiceConfig {
     pub image: Option<String>,
     pub ports: Option<Vec<String>>,
     pub networks: Option<Vec<String>>,
-    pub volumes: Option<Vec<String>>,
+    pub volumes: Option<Vec<VolumeSpec>>,
+    #[serde(skip)]
+    pub mounts: Vec<ResolvedMount>,
     pub environment: Option<Vec<String>>,
     pub container_name: Option<String>,
     pub command: Option<Vec<String>>,
     pub user: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum VolumeSpec {
+    Short(String),
+    Long(LongVolumeSpec),
+}
+
+#[derive(Deserialize)]
+pub struct LongVolumeSpec {
+    #[serde(rename = "type")]
+    pub mount_type: String,
+    pub source: Option<String>,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+pub struct ResolvedMount {
+    pub mount_type: MountType,
+    pub source: Option<String>,
+    pub target: String,
+    pub read_only: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -64,37 +90,196 @@ pub enum DockerModuleError {
 
     #[error("Bollard(docker) error")]
     Bollard(#[from] bollard::errors::Error),
+
+
+    #[error("Invalid volume specification: {0}")]
+    InvalidVolumeSpec(String),
 }
 
-fn resolve_bind_source(bind_spec: &str) -> Result<String, DockerModuleError> {
-    let (source, rest) = match bind_spec.split_once(':') {
-        Some((source, rest)) => (source, Some(rest)),
-        None => (bind_spec, None),
+fn resolve_pull_tag(image_reference: &str) -> Option<String> {
+    let last_segment = image_reference
+        .rsplit('/')
+        .next()
+        .unwrap_or(image_reference);
+
+    if last_segment.contains(':') || last_segment.contains('@') {
+        None
+    } else {
+        Some("latest".to_string())
+    }
+}
+
+fn is_host_path(source: &str) -> bool {
+    source.starts_with('/')
+        || source.starts_with("./")
+        || source.starts_with("../")
+        || source == "~"
+        || source.starts_with("~/")
+}
+
+fn resolve_host_path(source: &str, compose_dir: &Path) -> Result<PathBuf, DockerModuleError> {
+    let expanded = if source == "~" || source.starts_with("~/") {
+        let home_dir = env::var("HOME").map_err(|_| {
+            DockerModuleError::InvalidVolumeSpec(format!(
+                "cannot expand [{}]: HOME is not set",
+                source
+            ))
+        })?;
+        match source.strip_prefix("~/") {
+            Some(rest) => Path::new(&home_dir).join(rest),
+            None => PathBuf::from(home_dir),
+        }
+    } else {
+        PathBuf::from(source)
     };
 
-    let resolved_source = if !source.contains('/') || source.starts_with('/') {
-        source.to_string()
+    let absolute = if expanded.is_absolute() {
+        expanded
     } else {
-        let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
-        match fs::canonicalize(&joined) {
-            Ok(canonical) => canonical.to_string_lossy().into_owned(),
-            Err(canonicalize_error) => {
-                warn!(
-                    ["DOCKER_INIT"],
-                    "Could not resolve bind source [{}]: {}. Using [{}] as-is.",
-                    source,
-                    canonicalize_error,
-                    joined.display()
-                );
-                joined.to_string_lossy().into_owned()
+        compose_dir.join(expanded)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
             }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn resolve_short_volume(
+    volume_spec: &str,
+    compose_dir: &Path,
+) -> Result<ResolvedMount, DockerModuleError> {
+    let mut parts = volume_spec.splitn(3, ':');
+    let first = parts.next().unwrap_or_default();
+    let second = parts.next();
+    let modes = parts.next().unwrap_or_default();
+
+    if first.is_empty() {
+        return Err(DockerModuleError::InvalidVolumeSpec(
+            volume_spec.to_string(),
+        ));
+    }
+
+    let (source, target) = match second {
+        Some(target) if !target.is_empty() => (Some(first), target),
+        Some(_) => {
+            return Err(DockerModuleError::InvalidVolumeSpec(
+                volume_spec.to_string(),
+            ));
+        }
+        None => (None, first),
+    };
+
+    let mut read_only = false;
+    for mode in modes.split(',').filter(|mode| !mode.is_empty()) {
+        match mode {
+            "ro" => read_only = true,
+            "rw" => read_only = false,
+            unsupported_mode => warn!(
+                ["DOCKER_INIT"],
+                "Mount option [{}] in [{}] is not supported by the Mounts API, ignoring.",
+                unsupported_mode,
+                volume_spec
+            ),
+        }
+    }
+
+    let (mount_type, resolved_source) = match source {
+        None => (MountType::VOLUME, None),
+        Some(source) if is_host_path(source) => (
+            MountType::BIND,
+            Some(
+                resolve_host_path(source, compose_dir)?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ),
+        Some(source) => (MountType::VOLUME, Some(source.to_string())),
+    };
+
+    Ok(ResolvedMount {
+        mount_type,
+        source: resolved_source,
+        target: target.to_string(),
+        read_only,
+    })
+}
+
+fn resolve_long_volume(
+    volume_spec: LongVolumeSpec,
+    compose_dir: &Path,
+) -> Result<ResolvedMount, DockerModuleError> {
+    let mount_type = match volume_spec.mount_type.as_str() {
+        "bind" => MountType::BIND,
+        "volume" => MountType::VOLUME,
+        "tmpfs" => MountType::TMPFS,
+        "npipe" => MountType::NPIPE,
+        unsupported_type => {
+            return Err(DockerModuleError::InvalidVolumeSpec(format!(
+                "unsupported mount type [{}] for target [{}]",
+                unsupported_type, volume_spec.target
+            )));
         }
     };
 
-    Ok(match rest {
-        Some(rest) => format!("{}:{}", resolved_source, rest),
-        None => resolved_source,
+    let resolved_source = match (mount_type, volume_spec.source) {
+        (MountType::TMPFS, _) => None,
+        (MountType::BIND, Some(source)) => Some(
+            resolve_host_path(&source, compose_dir)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (MountType::BIND, None) => {
+            return Err(DockerModuleError::InvalidVolumeSpec(format!(
+                "bind mount for target [{}] is missing a source",
+                volume_spec.target
+            )));
+        }
+        (_, source) => source,
+    };
+
+    Ok(ResolvedMount {
+        mount_type,
+        source: resolved_source,
+        target: volume_spec.target,
+        read_only: volume_spec.read_only,
     })
+}
+
+fn resolve_volume_spec(
+    volume_spec: VolumeSpec,
+    compose_dir: &Path,
+) -> Result<ResolvedMount, DockerModuleError> {
+    match volume_spec {
+        VolumeSpec::Short(short_spec) => resolve_short_volume(&short_spec, compose_dir),
+        VolumeSpec::Long(long_spec) => resolve_long_volume(long_spec, compose_dir),
+    }
+}
+
+fn build_bollard_mount(resolved_mount: &ResolvedMount) -> Mount {
+    Mount {
+        typ: Some(resolved_mount.mount_type),
+        source: resolved_mount.source.clone(),
+        target: Some(resolved_mount.target.clone()),
+        read_only: Some(resolved_mount.read_only),
+        bind_options: matches!(resolved_mount.mount_type, MountType::BIND).then(|| {
+            MountBindOptions {
+                create_mountpoint: Some(true),
+                ..Default::default()
+            }
+        }),
+        ..Default::default()
+    }
 }
 
 pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModuleError> {
@@ -110,7 +295,8 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                 if let Some(extension) = path.extension() {
                     if extension == "yml" || extension == "yaml" {
                         let yaml_content = fs::read_to_string(&path)?;
-
+                        let compose_dir = path.parent().unwrap_or(compose_file_dir);
+                        
                         let compose_config: ComposeFile = serde_yaml::from_str(&yaml_content)?;
 
                         if let Some(services) = compose_config.services {
@@ -121,9 +307,11 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                                         *net = format!("{}", net);
                                     }
                                 }
-                                if let Some(ref mut volumes) = config.volumes {
-                                    for volume in volumes.iter_mut() {
-                                        *volume = resolve_bind_source(volume)?;
+                                if let Some(volumes) = config.volumes.take() {
+                                    for volume_spec in volumes {
+                                        config
+                                            .mounts
+                                            .push(resolve_volume_spec(volume_spec, compose_dir)?);
                                     }
                                 }
                                 definitions.services.push((unique_name, config));
@@ -411,8 +599,14 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
 
     let mut host_config = HostConfig::default();
 
-    if let Some(volumes) = &service_config.volumes {
-        host_config.binds = Some(volumes.clone());
+    if !service_config.mounts.is_empty() {
+        host_config.mounts = Some(
+            service_config
+                .mounts
+                .iter()
+                .map(build_bollard_mount)
+                .collect(),
+        );
     }
 
     if let Some(ports) = &service_config.ports {
@@ -468,13 +662,20 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
     };
 
     if let Some(image_name) = &service_config.image {
+        let image_tag = resolve_pull_tag(image_name);
+                
         info!(
             ["DOCKER_IMAGES"],
-            "Checking image [{}] for service [{}]...", image_name, service_name
+            "Checking image [{}{}] for service [{}]...", image_name,if let Some(image_tag) = &image_tag {
+                format!(":{:}", image_tag)
+            } else {
+                String::new()
+            }  , service_name                 
         );
 
         let pull_options = CreateImageOptions {
             from_image: Some(image_name.clone()),
+            tag: image_tag,
             ..Default::default()
         };
 
