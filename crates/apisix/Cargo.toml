@@ -1,0 +1,12 @@
+[package]
+name = "apisix"
+version = "0.1.0"
+edition = "2024"
+description = "Apisix rest wrapper."
+
+[dependencies]
+logger = { path = "../logger" }
+configuration = { path = "../configuration" }
+http_client = { path = "../http_client" }
+thiserror = "2.0.18"
+serde_json = "1"
