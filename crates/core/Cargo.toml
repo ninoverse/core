@@ -3,8 +3,11 @@ name = "core"
 version = "0.1.0"
 edition = "2024"
 default-run = "core"
+description = "Core binary of the ninoverse-core crate, starts the docker containers and apply db migrations (should be dealt by a separated crate)"
 
 [dependencies]
+logger = { path = "../logger" }
+configuration = { path = "../configuration" }
 tokio = { version = "1.52.3", features = [
     "macros",
     "rt-multi-thread",
@@ -14,7 +17,11 @@ tokio = { version = "1.52.3", features = [
 chrono = "0.4.45"
 config = "0.15.25"
 serde = { version = "1.0.228", features = ["derive"] }
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "migrate"] }
+sqlx = { version = "0.8.6", features = [
+    "runtime-tokio",
+    "postgres",
+    "migrate",
+] }
 rdkafka = { version = "0.39", features = ["cmake-build"] }
 futures = "0.3.32"
 actix-web = "4.14.0"

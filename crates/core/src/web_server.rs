@@ -2,11 +2,12 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, dev::Server, get, post
 use sqlx::{Pool, Postgres};
 use tokio::sync::mpsc::Sender;
 
-use crate::{configuration::Configuration, kafka_handler::KafkaChannelMessage};
+use crate::kafka_handler::KafkaChannelMessage;
+use configuration::NinoverseCoreConfiguration;
 
 pub fn init_request_handler(
     pool: &Pool<Postgres>,
-    app_configuration: &Configuration,
+    app_configuration: &NinoverseCoreConfiguration,
     kafka_thread_sender: &Sender<KafkaChannelMessage>,
 ) -> Result<Server, Box<dyn std::error::Error>> {
     let pool_cloned = pool.clone();

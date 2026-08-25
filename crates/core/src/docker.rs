@@ -1,19 +1,29 @@
 use bollard::{
-    Docker, models::{Mount, MountBindOptions, MountType, NetworkCreateRequest, VolumeCreateRequest}, plugin::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, PortBinding}, query_parameters::{
-        CreateContainerOptions, CreateImageOptions, InspectContainerOptions, RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptions,
+    Docker,
+    models::{Mount, MountBindOptions, MountType, NetworkCreateRequest, VolumeCreateRequest},
+    plugin::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, PortBinding},
+    query_parameters::{
+        CreateContainerOptions, CreateImageOptions, InspectContainerOptions,
+        RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptions,
     },
 };
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_yaml;
 use std::sync::Arc;
-use std::{collections::HashMap, env, fs, path::{Component, Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Component, Path, PathBuf},
+};
 use thiserror::Error;
 use tokio::{
-   sync::{Barrier, broadcast::Sender}, task::JoinSet, time::{Duration, sleep},
+    sync::{Barrier, broadcast::Sender},
+    task::JoinSet,
+    time::{Duration, sleep},
 };
 
-use crate::{error, info, warn};
+use logger::{error, info, warn};
 
 #[derive(Default)]
 pub struct DockerDefinitions {
@@ -90,7 +100,6 @@ pub enum DockerModuleError {
 
     #[error("Bollard(docker) error")]
     Bollard(#[from] bollard::errors::Error),
-
 
     #[error("Invalid volume specification: {0}")]
     InvalidVolumeSpec(String),
@@ -296,7 +305,7 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                     if extension == "yml" || extension == "yaml" {
                         let yaml_content = fs::read_to_string(&path)?;
                         let compose_dir = path.parent().unwrap_or(compose_file_dir);
-                        
+
                         let compose_config: ComposeFile = serde_yaml::from_str(&yaml_content)?;
 
                         if let Some(services) = compose_config.services {
@@ -448,29 +457,47 @@ async fn stop_and_cleanup_container(
         signal: Some("SIGTERM".to_string()),
         t: Some(10),
     };
-    match docker.stop_container(service_name, Some(stop_options)).await {
+    match docker
+        .stop_container(service_name, Some(stop_options))
+        .await
+    {
         Ok(_) => {
-            info!(["DOCKER_SHUTDOWN"], "Container '{}' stopped gracefully.", service_name);
+            info!(
+                ["DOCKER_SHUTDOWN"],
+                "Container '{}' stopped gracefully.", service_name
+            );
             if remove_containers_on_shutdown {
-                let remove_container_options = RemoveContainerOptionsBuilder::default()
-                    .force(true)
-                    .build();
-                match docker.remove_container(service_name, Some(remove_container_options)).await {
+                let remove_container_options =
+                    RemoveContainerOptionsBuilder::default().force(true).build();
+                match docker
+                    .remove_container(service_name, Some(remove_container_options))
+                    .await
+                {
                     Ok(_) => info!(["DOCKER_SHUTDOWN"], "Container '{}' removed.", service_name),
-                    Err(remove_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to remove '{}': {}", service_name, remove_container_error),
+                    Err(remove_container_error) => error!(
+                        ["DOCKER_SHUTDOWN"],
+                        "Failed to remove '{}': {}", service_name, remove_container_error
+                    ),
                 };
             } else {
-                info!(["DOCKER_SHUTDOWN"], "Container '{}' left in place (remove_containers_on_shutdown=false).", service_name);
+                info!(
+                    ["DOCKER_SHUTDOWN"],
+                    "Container '{}' left in place (remove_containers_on_shutdown=false).",
+                    service_name
+                );
             }
-        },
-        Err(stop_container_error) => error!(["DOCKER_SHUTDOWN"], "Failed to stop '{}': {}", service_name, stop_container_error),
+        }
+        Err(stop_container_error) => error!(
+            ["DOCKER_SHUTDOWN"],
+            "Failed to stop '{}': {}", service_name, stop_container_error
+        ),
     }
 }
 
 pub async fn start_docker_container(
     docker_services: Vec<(String, ServiceConfig)>,
     docker: &Docker,
-    shutdown_broadcast_sender: & Sender<()>,
+    shutdown_broadcast_sender: &Sender<()>,
     join_set: &mut JoinSet<()>,
     remove_containers_on_shutdown: bool,
 ) -> Result<(), DockerModuleError> {
@@ -663,14 +690,17 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
 
     if let Some(image_name) = &service_config.image {
         let image_tag = resolve_pull_tag(image_name);
-                
+
         info!(
             ["DOCKER_IMAGES"],
-            "Checking image [{}{}] for service [{}]...", image_name,if let Some(image_tag) = &image_tag {
+            "Checking image [{}{}] for service [{}]...",
+            image_name,
+            if let Some(image_tag) = &image_tag {
                 format!(":{:}", image_tag)
             } else {
                 String::new()
-            }  , service_name                 
+            },
+            service_name
         );
 
         let pull_options = CreateImageOptions {
@@ -734,8 +764,7 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
         Ok(_) => {
             info!(
                 ["DOCKER_INIT"],
-                "Container [{}] started successfully, waiting for healthy state.",
-                &service_name
+                "Container [{}] started successfully, waiting for healthy state.", &service_name
             );
             loop {
                 let inspect = docker
