@@ -1,0 +1,15 @@
+[package]
+name = "init_kanidm_apisix"
+version = "0.1.0"
+edition = "2024"
+description = "Provisions kanidm OAuth2 clients and matching APISIX OIDC routes"
+
+[dependencies]
+logger = { path = "../logger" }
+configuration = { path = "../configuration" }
+exec = { path = "../exec" }
+http_client = { path = "../http_client" }
+apisix = { path = "../apisix" }
+kanidm = { path = "../kanidm" }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
