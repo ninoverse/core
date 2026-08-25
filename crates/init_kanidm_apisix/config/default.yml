@@ -1,0 +1,97 @@
+domain: "nicolapasqualini.it"
+kanidm_origin: "https://auth.nicolapasqualini.it"
+secrets_dir: "./secrets"
+
+services:
+  - client_id: "victorialogs"
+    display_name: "VictoriaLogs"
+    subdomain: "victorialogs"
+    upstream: "victorialogs:9428"
+    group: "victorialogs_users"
+    mode: "gate"
+  - client_id: "apisix-dashboard"
+    display_name: "APISIX Dashboard"
+    subdomain: "apidashboard"
+    upstream: "apisix:9180"
+    group: "apisix_admins"
+    mode: "gate"
+  - client_id: "sonarqube"
+    display_name: "SonarQube"
+    subdomain: "sonarqube"
+    upstream: "sonarqube:9000"
+    group: "sonarqube_users"
+    mode: "gate"
+  - client_id: "openobserve"
+    display_name: "OpenObserve"
+    subdomain: "openobserve"
+    upstream: "openobserve:5080"
+    group: "openobserve_users"
+    mode: "gate"
+  # nora serves a browser UI and a package-manager API on one host. The UI and
+  # every credential/admin endpoint sit behind kanidm; the package paths are
+  # passed through untouched so clients can present nora's own tokens.
+  # /api/* is gated wholesale: it holds token minting (/api/tokens),
+  # revocation, the admin reindex, and the UI's htmx backend — and nora leaves
+  # those open when public_web_ui is on, so this route is what protects them.
+  - client_id: "registry-ui"
+    display_name: "Nora Registry"
+    subdomain: "registry"
+    upstream: "nora:4000"
+    group: "registry_users"
+    mode: "gate"
+    priority: 100
+    uris:
+      - "/ui"
+      - "/ui/*"
+      - "/api/*"
+      - "/api-docs"
+      - "/api-docs/*"
+      - "/metrics"
+  # Paths taken from nora's own /api-docs/openapi.json. Formats nora has not
+  # enabled still answer here (401/404 from nora rather than from APISIX), so
+  # turning one on later needs no gateway change.
+  - client_id: "registry-cli"
+    display_name: "Nora Registry (CLI)"
+    subdomain: "registry"
+    upstream: "nora:4000"
+    group: "registry_users"
+    mode: "proxy"
+    priority: 0
+    uris:
+      - "/cargo/*"
+      - "/npm/*"
+      - "/maven2/*"
+      - "/nuget/*"
+      - "/gems/*"
+      - "/go/*"
+      - "/deb/*"
+      - "/rpm/*"
+      - "/pub/*"
+      - "/ansible/*"
+      - "/terraform/*"
+      - "/conan/*"
+      - "/raw/*"
+      - "/simple/*"
+      - "/v2/*"
+      - "/health"
+      - "/ready"
+  - client_id: "grafana"
+    display_name: "Grafana"
+    subdomain: "grafana"
+    group: "grafana_users"
+    mode: "native"
+    native_redirect_url: "https://grafana.nicolapasqualini.it/login/generic_oauth"
+
+persons:
+  - name: "nino"
+    display_name: "Nino"
+    legal_name: "Nicola Pasqualini"
+    mail: "nino@nicolapasqualini.it"
+    groups:
+      - "ninoverse-admin"
+      - "apisix_admins"
+      - "grafana_users"
+      - "victorialogs_users"
+      - "sonarqube_users"
+      - "openobserve_users"
+      - "registry_users"

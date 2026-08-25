@@ -1563,6 +1563,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "init_kanidm_apisix"
+version = "0.1.0"
+dependencies = [
+ "apisix",
+ "configuration",
+ "exec",
+ "http_client",
+ "kanidm",
+ "logger",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

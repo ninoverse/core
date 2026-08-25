@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/init_kanidm_apisix",
     "crates/logger",
     "crates/kanidm",
     "crates/apisix",
