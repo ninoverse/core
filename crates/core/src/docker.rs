@@ -49,7 +49,7 @@ pub struct ServiceConfig {
     pub mounts: Vec<ResolvedMount>,
     pub environment: Option<Vec<String>>,
     pub container_name: Option<String>,
-    pub command: Option<Vec<String>>,
+    pub command: Option<String>,
     pub user: Option<String>,
 }
 
@@ -667,7 +667,7 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
 
     let _container_name = service_config.container_name.unwrap_or_default();
 
-    let command = service_config.command.unwrap_or_default();
+    let command = shlex::split(&service_config.command.unwrap_or_default()).unwrap_or_default();
 
     let user = service_config.user.unwrap_or_default();
 
