@@ -1,6 +1,9 @@
 use bollard::{
     Docker,
-    models::{Mount, MountBindOptions, MountType, NetworkCreateRequest, VolumeCreateRequest},
+    models::{
+        ContainerStateStatusEnum, HealthStatusEnum, Mount, MountBindOptions, MountType,
+        NetworkCreateRequest, VolumeCreateRequest,
+    },
     plugin::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, PortBinding},
     query_parameters::{
         CreateContainerOptions, CreateImageOptions, InspectContainerOptions,
@@ -18,7 +21,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::{Barrier, broadcast::Sender},
+    sync::{Barrier, broadcast::Sender, watch},
     task::JoinSet,
     time::{Duration, sleep},
 };
@@ -51,6 +54,54 @@ pub struct ServiceConfig {
     pub container_name: Option<String>,
     pub command: Option<String>,
     pub user: Option<String>,
+    pub depends_on: Option<DependsOn>,
+}
+
+impl ServiceConfig {
+    /// Normalize `depends_on` (both the short list form and the long map form)
+    /// into a flat list of `(dependency name, condition)`. List entries default
+    /// to `service_started`.
+    pub fn dependencies(&self) -> Vec<(String, DependencyCondition)> {
+        match &self.depends_on {
+            None => Vec::new(),
+            Some(DependsOn::List(names)) => names
+                .iter()
+                .map(|name| (name.clone(), DependencyCondition::ServiceStarted))
+                .collect(),
+            Some(DependsOn::Map(entries)) => entries
+                .iter()
+                .map(|(name, entry)| (name.clone(), entry.condition))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum DependsOn {
+    /// `depends_on: [db, redis]`
+    List(Vec<String>),
+    /// `depends_on: { db: { condition: service_healthy } }`
+    Map(HashMap<String, DependsOnEntry>),
+}
+
+#[derive(Deserialize)]
+pub struct DependsOnEntry {
+    #[serde(default)]
+    pub condition: DependencyCondition,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+// Variant names intentionally mirror the Compose `service_*` condition strings.
+#[allow(clippy::enum_variant_names)]
+pub enum DependencyCondition {
+    #[serde(rename = "service_started")]
+    #[default]
+    ServiceStarted,
+    #[serde(rename = "service_healthy")]
+    ServiceHealthy,
+    #[serde(rename = "service_completed_successfully")]
+    ServiceCompletedSuccessfully,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +154,12 @@ pub enum DockerModuleError {
 
     #[error("Invalid volume specification: {0}")]
     InvalidVolumeSpec(String),
+
+    #[error("Service [{service}] depends on unknown service [{dependency}]")]
+    UnknownDependency { service: String, dependency: String },
+
+    #[error("Dependency cycle detected among services: {0}")]
+    DependencyCycle(String),
 }
 
 fn resolve_pull_tag(image_reference: &str) -> Option<String> {
@@ -494,6 +551,172 @@ async fn stop_and_cleanup_container(
     }
 }
 
+/// Readiness a service task broadcasts to its dependents. Boot failure is
+/// signalled by the sender being dropped (the task ends without sending
+/// `Started`), which surfaces to a waiting dependent as a receiver error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceStatus {
+    Pending,
+    Started,
+}
+
+/// Poll cadence and cap when waiting for a dependency to become healthy or to
+/// complete. The cap keeps a never-ready dependency from hanging startup forever.
+const DEPENDENCY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const DEPENDENCY_WAIT_MAX_ATTEMPTS: u32 = 120;
+
+/// Validate the `depends_on` graph before booting anything: every referenced
+/// dependency must be a known service, and there must be no cycles. Failing here
+/// avoids a startup deadlock on an unsatisfiable graph.
+fn validate_dependency_graph(
+    services: &[(String, ServiceConfig)],
+) -> Result<(), DockerModuleError> {
+    use std::collections::HashSet;
+
+    let known: HashSet<String> = services.iter().map(|(name, _)| name.clone()).collect();
+
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, config) in services {
+        let mut deps = Vec::new();
+        for (dependency, _) in config.dependencies() {
+            if !known.contains(&dependency) {
+                return Err(DockerModuleError::UnknownDependency {
+                    service: name.clone(),
+                    dependency,
+                });
+            }
+            deps.push(dependency);
+        }
+        graph.insert(name.clone(), deps);
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        Visiting,
+        Visited,
+    }
+
+    fn visit(
+        node: &str,
+        graph: &HashMap<String, Vec<String>>,
+        marks: &mut HashMap<String, Mark>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), DockerModuleError> {
+        match marks.get(node) {
+            Some(Mark::Visited) => return Ok(()),
+            Some(Mark::Visiting) => {
+                let cycle_start = stack.iter().position(|n| n == node).unwrap_or(0);
+                let mut cycle: Vec<String> = stack[cycle_start..].to_vec();
+                cycle.push(node.to_string());
+                return Err(DockerModuleError::DependencyCycle(cycle.join(" -> ")));
+            }
+            None => {}
+        }
+
+        marks.insert(node.to_string(), Mark::Visiting);
+        stack.push(node.to_string());
+        if let Some(dependencies) = graph.get(node) {
+            for dependency in dependencies {
+                visit(dependency, graph, marks, stack)?;
+            }
+        }
+        stack.pop();
+        marks.insert(node.to_string(), Mark::Visited);
+        Ok(())
+    }
+
+    let mut marks: HashMap<String, Mark> = HashMap::new();
+    for (name, _) in services {
+        let mut stack = Vec::new();
+        visit(name, &graph, &mut marks, &mut stack)?;
+    }
+
+    Ok(())
+}
+
+/// Wait until `dependency_name` satisfies `condition`. Returns `Err` (with a
+/// short reason) if the dependency failed to start, became unhealthy, exited
+/// non-zero, or did not reach the condition within the cap.
+async fn wait_for_dependency(
+    docker: &Docker,
+    dependency_name: &str,
+    condition: DependencyCondition,
+    status_receiver: &mut watch::Receiver<ServiceStatus>,
+) -> Result<(), String> {
+    // First wait until the dependency's container has at least been launched. A
+    // closed channel means the dependency task ended without starting.
+    if status_receiver
+        .wait_for(|status| *status == ServiceStatus::Started)
+        .await
+        .is_err()
+    {
+        return Err("failed to start".to_string());
+    }
+
+    match condition {
+        DependencyCondition::ServiceStarted => Ok(()),
+        DependencyCondition::ServiceHealthy => wait_for_healthy(docker, dependency_name).await,
+        DependencyCondition::ServiceCompletedSuccessfully => {
+            wait_for_completion(docker, dependency_name).await
+        }
+    }
+}
+
+async fn wait_for_healthy(docker: &Docker, dependency_name: &str) -> Result<(), String> {
+    for _ in 0..DEPENDENCY_WAIT_MAX_ATTEMPTS {
+        let state = docker
+            .inspect_container(dependency_name, None::<InspectContainerOptions>)
+            .await
+            .map_err(|inspect_error| format!("could not be inspected: {}", inspect_error))?
+            .state;
+
+        match state.as_ref().and_then(|state| state.health.as_ref()) {
+            Some(health) => match health.status {
+                Some(HealthStatusEnum::HEALTHY) => return Ok(()),
+                Some(HealthStatusEnum::UNHEALTHY) => return Err("became unhealthy".to_string()),
+                _ => {}
+            },
+            // No healthcheck defined on the container: fall back to "running".
+            None => {
+                if state.and_then(|state| state.running).unwrap_or(false) {
+                    return Ok(());
+                }
+            }
+        }
+
+        sleep(DEPENDENCY_POLL_INTERVAL).await;
+    }
+
+    Err("did not become healthy in time".to_string())
+}
+
+async fn wait_for_completion(docker: &Docker, dependency_name: &str) -> Result<(), String> {
+    for _ in 0..DEPENDENCY_WAIT_MAX_ATTEMPTS {
+        let state = docker
+            .inspect_container(dependency_name, None::<InspectContainerOptions>)
+            .await
+            .map_err(|inspect_error| format!("could not be inspected: {}", inspect_error))?
+            .state;
+
+        if let Some(state) = state {
+            let terminal = matches!(
+                state.status,
+                Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD)
+            );
+            if terminal {
+                return match state.exit_code.unwrap_or(-1) {
+                    0 => Ok(()),
+                    exit_code => Err(format!("exited with code {}", exit_code)),
+                };
+            }
+        }
+
+        sleep(DEPENDENCY_POLL_INTERVAL).await;
+    }
+
+    Err("did not complete in time".to_string())
+}
+
 pub async fn start_docker_container(
     docker_services: Vec<(String, ServiceConfig)>,
     docker: &Docker,
@@ -501,15 +724,75 @@ pub async fn start_docker_container(
     join_set: &mut JoinSet<()>,
     remove_containers_on_shutdown: bool,
 ) -> Result<(), DockerModuleError> {
+    validate_dependency_graph(&docker_services)?;
+
     let barrier = Arc::new(Barrier::new(docker_services.len() + 1));
     let mut startup_shutdown_receiver = shutdown_broadcast_sender.subscribe();
+
+    // One readiness channel per service. Producers publish `Started`; dependents
+    // subscribe to the channels of the services they depend on.
+    let mut status_senders: HashMap<String, watch::Sender<ServiceStatus>> = HashMap::new();
+    let mut status_receivers: HashMap<String, watch::Receiver<ServiceStatus>> = HashMap::new();
+    for (service_name, _) in &docker_services {
+        let (sender, receiver) = watch::channel(ServiceStatus::Pending);
+        status_senders.insert(service_name.clone(), sender);
+        status_receivers.insert(service_name.clone(), receiver);
+    }
 
     for (service_name, service_config) in docker_services {
         let barrier_cloned = barrier.clone();
         let docker_cloned = docker.clone();
         let mut shutdown_broadcast_sender_subscribed = shutdown_broadcast_sender.subscribe();
 
+        let status_sender = status_senders
+            .remove(&service_name)
+            .expect("every service has a status sender");
+        let dependency_receivers: Vec<(
+            String,
+            DependencyCondition,
+            watch::Receiver<ServiceStatus>,
+        )> = service_config
+            .dependencies()
+            .into_iter()
+            .map(|(dependency_name, condition)| {
+                let receiver = status_receivers
+                    .get(&dependency_name)
+                    .expect("dependency validated to exist")
+                    .clone();
+                (dependency_name, condition, receiver)
+            })
+            .collect();
+
         join_set.spawn(async move {
+            // Phase 0: wait for every dependency to satisfy its condition.
+            for (dependency_name, condition, mut dependency_receiver) in dependency_receivers {
+                tokio::select! {
+                    wait_result = wait_for_dependency(
+                        &docker_cloned,
+                        &dependency_name,
+                        condition,
+                        &mut dependency_receiver,
+                    ) => {
+                        if let Err(reason) = wait_result {
+                            warn!(
+                                ["DOCKER_INIT"],
+                                "Service [{}] will not start: dependency [{}] {}.",
+                                service_name, dependency_name, reason
+                            );
+                            return;
+                        }
+                    }
+                    _ = shutdown_broadcast_sender_subscribed.recv() => {
+                        info!(
+                            ["DOCKER_SHUTDOWN"],
+                            "Shutdown signal received by task '{}' while waiting for dependency '{}'. Aborting boot...",
+                            service_name, dependency_name
+                        );
+                        return;
+                    }
+                }
+            }
+
             tokio::select! {
                 _ = boot_service(&docker_cloned, &service_name, service_config) => {}
                 _ = shutdown_broadcast_sender_subscribed.recv() => {
@@ -527,6 +810,9 @@ pub async fn start_docker_container(
                     return;
                 }
             }
+
+            // Publish readiness so dependents can proceed.
+            let _ = status_sender.send(ServiceStatus::Started);
 
             info!(
                 ["DOCKER_INIT"],
@@ -772,7 +1058,15 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
                     .await
                     .unwrap();
                 if let Some(state) = inspect.state {
-                    if state.running.unwrap_or(false) {
+                    let running = state.running.unwrap_or(false);
+                    // A short-lived container (e.g. a `service_completed_successfully`
+                    // dependency) may exit before `running` is ever observed true;
+                    // treat a terminal state as launched so the task can proceed.
+                    let terminal = matches!(
+                        state.status,
+                        Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD)
+                    );
+                    if running || terminal {
                         break;
                     }
                 }
@@ -793,5 +1087,122 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
                 service_name, volume_creation_error
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service_from_yaml(yaml: &str) -> ServiceConfig {
+        serde_yaml::from_str(yaml).expect("valid service yaml")
+    }
+
+    fn services(specs: &[(&str, &str)]) -> Vec<(String, ServiceConfig)> {
+        specs
+            .iter()
+            .map(|(name, yaml)| (name.to_string(), service_from_yaml(yaml)))
+            .collect()
+    }
+
+    #[test]
+    fn depends_on_list_form_defaults_to_started() {
+        let service = service_from_yaml("image: busybox\ndepends_on:\n  - db\n  - redis\n");
+        let deps: HashMap<String, DependencyCondition> =
+            service.dependencies().into_iter().collect();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps["db"], DependencyCondition::ServiceStarted);
+        assert_eq!(deps["redis"], DependencyCondition::ServiceStarted);
+    }
+
+    #[test]
+    fn depends_on_map_form_reads_conditions() {
+        let service = service_from_yaml(
+            "image: busybox\n\
+             depends_on:\n\
+             \x20 db:\n\
+             \x20   condition: service_healthy\n\
+             \x20 init:\n\
+             \x20   condition: service_completed_successfully\n",
+        );
+        let deps: HashMap<String, DependencyCondition> =
+            service.dependencies().into_iter().collect();
+        assert_eq!(deps["db"], DependencyCondition::ServiceHealthy);
+        assert_eq!(
+            deps["init"],
+            DependencyCondition::ServiceCompletedSuccessfully
+        );
+    }
+
+    #[test]
+    fn depends_on_map_form_defaults_missing_condition() {
+        let service = service_from_yaml("image: busybox\ndepends_on:\n  db: {}\n");
+        let deps: HashMap<String, DependencyCondition> =
+            service.dependencies().into_iter().collect();
+        assert_eq!(deps["db"], DependencyCondition::ServiceStarted);
+    }
+
+    #[test]
+    fn no_depends_on_yields_no_dependencies() {
+        let service = service_from_yaml("image: busybox\n");
+        assert!(service.dependencies().is_empty());
+    }
+
+    #[test]
+    fn validate_accepts_valid_dag() {
+        let services = services(&[
+            ("db", "image: postgres\n"),
+            ("app", "image: busybox\ndepends_on:\n  - db\n"),
+        ]);
+        assert!(validate_dependency_graph(&services).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_dependency() {
+        let services = services(&[("app", "image: busybox\ndepends_on:\n  - missing\n")]);
+        match validate_dependency_graph(&services) {
+            Err(DockerModuleError::UnknownDependency {
+                service,
+                dependency,
+            }) => {
+                assert_eq!(service, "app");
+                assert_eq!(dependency, "missing");
+            }
+            other => panic!("expected UnknownDependency, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_self_cycle() {
+        let services = services(&[("a", "image: busybox\ndepends_on:\n  - a\n")]);
+        assert!(matches!(
+            validate_dependency_graph(&services),
+            Err(DockerModuleError::DependencyCycle(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_direct_cycle() {
+        let services = services(&[
+            ("a", "image: busybox\ndepends_on:\n  - b\n"),
+            ("b", "image: busybox\ndepends_on:\n  - a\n"),
+        ]);
+        assert!(matches!(
+            validate_dependency_graph(&services),
+            Err(DockerModuleError::DependencyCycle(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_multi_node_cycle() {
+        let services = services(&[
+            ("a", "image: busybox\ndepends_on:\n  - b\n"),
+            ("b", "image: busybox\ndepends_on:\n  - c\n"),
+            ("c", "image: busybox\ndepends_on:\n  - a\n"),
+        ]);
+        assert!(matches!(
+            validate_dependency_graph(&services),
+            Err(DockerModuleError::DependencyCycle(_))
+        ));
     }
 }
