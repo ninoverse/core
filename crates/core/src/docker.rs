@@ -2,7 +2,7 @@ use bollard::{
     Docker,
     models::{
         ContainerStateStatusEnum, HealthStatusEnum, Mount, MountBindOptions, MountType,
-        NetworkCreateRequest, VolumeCreateRequest,
+        NetworkCreateRequest, RestartPolicy, RestartPolicyNameEnum, VolumeCreateRequest,
     },
     plugin::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, PortBinding},
     query_parameters::{
@@ -55,6 +55,9 @@ pub struct ServiceConfig {
     pub command: Option<String>,
     pub user: Option<String>,
     pub depends_on: Option<DependsOn>,
+    pub restart: Option<String>,
+    #[serde(skip)]
+    pub restart_policy: Option<RestartPolicy>,
 }
 
 impl ServiceConfig {
@@ -155,6 +158,9 @@ pub enum DockerModuleError {
     #[error("Invalid volume specification: {0}")]
     InvalidVolumeSpec(String),
 
+    #[error("Invalid restart policy: {0}")]
+    InvalidRestartPolicy(String),
+
     #[error("Service [{service}] depends on unknown service [{dependency}]")]
     UnknownDependency { service: String, dependency: String },
 
@@ -173,6 +179,36 @@ fn resolve_pull_tag(image_reference: &str) -> Option<String> {
     } else {
         Some("latest".to_string())
     }
+}
+
+/// Map the compose `restart:` key onto a Docker restart policy. An absent key
+/// means `no`, matching the Compose default.
+fn resolve_restart_policy(restart: Option<&str>) -> Result<RestartPolicy, DockerModuleError> {
+    let (name, maximum_retry_count) = match restart {
+        None | Some("no") => (RestartPolicyNameEnum::NO, None),
+        Some("always") => (RestartPolicyNameEnum::ALWAYS, None),
+        Some("unless-stopped") => (RestartPolicyNameEnum::UNLESS_STOPPED, None),
+        Some("on-failure") => (RestartPolicyNameEnum::ON_FAILURE, None),
+        Some(policy) => match policy.strip_prefix("on-failure:") {
+            Some(max_retries) => {
+                let max_retries = max_retries
+                    .parse::<i64>()
+                    .map_err(|_| DockerModuleError::InvalidRestartPolicy(policy.to_string()))?;
+                if max_retries < 0 {
+                    return Err(DockerModuleError::InvalidRestartPolicy(policy.to_string()));
+                }
+                (RestartPolicyNameEnum::ON_FAILURE, Some(max_retries))
+            }
+            None => {
+                return Err(DockerModuleError::InvalidRestartPolicy(policy.to_string()));
+            }
+        },
+    };
+
+    Ok(RestartPolicy {
+        name: Some(name),
+        maximum_retry_count,
+    })
 }
 
 fn is_host_path(source: &str) -> bool {
@@ -380,6 +416,8 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                                             .push(resolve_volume_spec(volume_spec, compose_dir)?);
                                     }
                                 }
+                                config.restart_policy =
+                                    Some(resolve_restart_policy(config.restart.as_deref())?);
                                 definitions.services.push((unique_name, config));
                             }
                         }
@@ -837,56 +875,16 @@ pub async fn start_docker_container(
                 }
             }
 
-            loop {
-                tokio::select! {
-                    _ = sleep(std::time::Duration::from_secs(5)) => {
+            // Restarts are owned by the Docker daemon through the container's
+            // restart policy, so the task only waits for shutdown from here.
+            let _ = shutdown_broadcast_sender_subscribed.recv().await;
+            info!(
+                ["DOCKER_SHUTDOWN"],
+                "Shutdown signal received by task '{}'. Stopping container...", service_name
+            );
 
-                        let inspect = docker_cloned
-                            .inspect_container(&service_name, None::<InspectContainerOptions>)
-                            .await;
-
-                        match inspect {
-                            Ok(details) => {
-                                let is_running = details
-                                    .state
-                                    .and_then(|container| container.running)
-                                    .unwrap_or(false);
-                                if !is_running {
-                                    warn!(
-                                        ["DOCKER_INIT"],
-                                        "Crash detected for [{}]! Restarting...", service_name
-                                    );
-                                    let _ = docker_cloned
-                                        .start_container(&service_name, None::<StartContainerOptions>)
-                                        .await;
-                                }
-                            }
-                            Err(docker_inspect_error) => {
-                                error!(
-                                    ["DOCKER_INIT"],
-                                    "Error inspecting [{}]: {}. check if docker daemon is running",
-                                    service_name,
-                                    docker_inspect_error
-                                );
-                            }
-                        }
-                    }
-
-                    _ = shutdown_broadcast_sender_subscribed.recv() => {
-                        info!(["DOCKER_SHUTDOWN"], "Shutdown signal received by task '{}'. Stopping container...", service_name);
-
-                        stop_and_cleanup_container(
-                            &docker_cloned,
-                            &service_name,
-                            remove_containers_on_shutdown,
-                        )
-                        .await;
-
-                        break;
-                    }
-                }
-
-            }
+            stop_and_cleanup_container(&docker_cloned, &service_name, remove_containers_on_shutdown)
+                .await;
         });
     }
 
@@ -910,7 +908,10 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
         "Booting up service: {} (Image: {:?})", service_name, service_config.image
     );
 
-    let mut host_config = HostConfig::default();
+    let mut host_config = HostConfig {
+        restart_policy: service_config.restart_policy.clone(),
+        ..Default::default()
+    };
 
     if !service_config.mounts.is_empty() {
         host_config.mounts = Some(
@@ -1204,5 +1205,56 @@ mod tests {
             validate_dependency_graph(&services),
             Err(DockerModuleError::DependencyCycle(_))
         ));
+    }
+
+    #[test]
+    fn unquoted_restart_no_parses_as_string_not_bool() {
+        // serde_yaml follows the YAML 1.2 core schema, so bare `no` stays a
+        // string. Guards against the classic compose `restart: no` gotcha.
+        let service = service_from_yaml("image: busybox\nrestart: no\n");
+        assert_eq!(service.restart.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn restart_policy_defaults_to_no_when_absent() {
+        let policy = resolve_restart_policy(None).expect("default policy");
+        assert_eq!(policy.name, Some(RestartPolicyNameEnum::NO));
+        assert_eq!(policy.maximum_retry_count, None);
+    }
+
+    #[test]
+    fn restart_policy_maps_named_policies() {
+        let cases = [
+            ("no", RestartPolicyNameEnum::NO),
+            ("always", RestartPolicyNameEnum::ALWAYS),
+            ("unless-stopped", RestartPolicyNameEnum::UNLESS_STOPPED),
+            ("on-failure", RestartPolicyNameEnum::ON_FAILURE),
+        ];
+        for (input, expected) in cases {
+            let policy = resolve_restart_policy(Some(input)).expect("valid policy");
+            assert_eq!(policy.name, Some(expected), "for input [{}]", input);
+            assert_eq!(policy.maximum_retry_count, None, "for input [{}]", input);
+        }
+    }
+
+    #[test]
+    fn restart_policy_reads_on_failure_retry_count() {
+        let policy = resolve_restart_policy(Some("on-failure:5")).expect("valid policy");
+        assert_eq!(policy.name, Some(RestartPolicyNameEnum::ON_FAILURE));
+        assert_eq!(policy.maximum_retry_count, Some(5));
+    }
+
+    #[test]
+    fn restart_policy_rejects_invalid_values() {
+        for input in ["sometimes", "on-failure:abc", "on-failure:-1", ""] {
+            assert!(
+                matches!(
+                    resolve_restart_policy(Some(input)),
+                    Err(DockerModuleError::InvalidRestartPolicy(_))
+                ),
+                "expected [{}] to be rejected",
+                input
+            );
+        }
     }
 }
