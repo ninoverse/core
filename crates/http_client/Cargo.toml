@@ -1,0 +1,10 @@
+[package]
+name = "http_client"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP requests over reqwest, or over curl running inside a container."
+
+[dependencies]
+exec = { path = "../exec" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+thiserror = "2.0.18"

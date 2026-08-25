@@ -1,0 +1,11 @@
+[package]
+name = "exec"
+version = "0.1.0"
+edition = "2024"
+description = "Run a command locally or inside a docker container."
+
+[dependencies]
+bollard = "0.21.0"
+futures-util = "0.3.32"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["io-util", "process"] }
