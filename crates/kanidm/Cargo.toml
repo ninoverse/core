@@ -1,0 +1,11 @@
+[package]
+name = "kanidm"
+version = "0.1.0"
+edition = "2024"
+description = "Kanidm cli wrapper."
+
+[dependencies]
+logger = { path = "../logger" }
+configuration = { path = "../configuration" }
+exec = { path = "../exec" }
+thiserror = "2.0.18"

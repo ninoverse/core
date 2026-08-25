@@ -231,6 +231,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "apisix"
+version = "0.1.0"
+dependencies = [
+ "configuration",
+ "http_client",
+ "logger",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1593,6 +1604,16 @@ dependencies = [
  "pest",
  "pest_derive",
  "serde",
+]
+
+[[package]]
+name = "kanidm"
+version = "0.1.0"
+dependencies = [
+ "configuration",
+ "exec",
+ "logger",
+ "thiserror",
 ]
 
 [[package]]

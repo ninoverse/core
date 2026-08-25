@@ -2,6 +2,8 @@
 members = [
     "crates/core",
     "crates/logger",
+    "crates/kanidm",
+    "crates/apisix",
     "crates/exec",
     "crates/http_client",
     "crates/configuration"
