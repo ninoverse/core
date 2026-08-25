@@ -1,37 +1,38 @@
-mod configuration;
 mod db_handler;
 mod docker;
 mod kafka_handler;
-mod logger;
 mod web_server;
 
-// use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
-// use sqlx::{Pool, Postgres};
+use sqlx::{Pool, Postgres};
 
 use tokio::{
-    sync::broadcast,
+    sync::{broadcast, mpsc::channel},
     task::JoinSet,
-    time::{Duration, sleep},
 };
 
-use configuration::Configuration;
+use configuration::NinoverseCoreConfiguration;
 
-// use web_server::init_request_handler;
+use web_server::init_request_handler;
 
-// use kafka_handler::init_kafka;
+use kafka_handler::init_kafka;
 
 use docker::{
     create_docker_client, create_docker_networks, create_docker_volumes, find_docker_definitions,
     start_docker_container,
 };
 
+use logger::{error, info};
+
+const CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/config/default");
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logger::init();
     info!(["MAIN"], "Program started");
     info!(["MAIN"], "Loading configuration");
-    let app_configuration = match Configuration::build() {
+    let app_configuration = match NinoverseCoreConfiguration::build(Path::new(CONFIG)) {
         Ok(app_configuration) => {
             info!(["MAIN"], "Configuration loaded: \n{:#?}", app_configuration);
             app_configuration
@@ -41,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ["MAIN"],
                 "Failed to load configuration: {}", configuration_error
             );
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             std::process::exit(1);
         }
     };
@@ -59,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let docker = create_docker_client().await?;
     info!(["MAIN"], "Searching docker containers definitions");
     let docker_definitions = find_docker_definitions().await?;
-    // TODO: Could be together (volumes + network)
     info!(["MAIN"], "Creating docker network");
     create_docker_networks(docker_definitions.networks, &docker).await?;
     info!(["MAIN"], "Creating docker volumes");
@@ -73,6 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_configuration.docker.remove_containers_on_shutdown,
     )
     .await?;
+    info!(["MAIN"], "Waiting 5sec to let services actually start");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     info!(["MAIN"], "Initializing DB pool");
     let db_pool_result = tokio::select! {
         _ = shutdown_receiver.recv() => None,
@@ -81,12 +84,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut startup_error = None;
     match db_pool_result {
-        None => info!(["MAIN"], "Shutdown requested during startup, skipping run phase."),
+        None => info!(
+            ["MAIN"],
+            "Shutdown requested during startup, skipping run phase."
+        ),
         Some(Err(db_pool_error)) => startup_error = Some(db_pool_error),
-        Some(Ok(_pool)) => {
+        Some(Ok(pool)) => {
             info!(["MAIN"], "Starting threads");
             // run_threads(pool, app_configuration).await?;
-            info!(["MAIN"], "Orchestrator running, press Ctrl+C to stop.");
             let _ = shutdown_receiver.recv().await;
         }
     }
@@ -98,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = res {
             error!(["MAIN"], "A spawned task panicked during shutdown: {}", e);
         }
-    };
+    }
 
     match startup_error {
         Some(startup_error) => Err(startup_error.into()),
@@ -106,51 +111,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-// async fn run_threads(
-//     pool: Pool<Postgres>,
-//     app_configuration: Configuration,
-// ) -> Result<(), Box<dyn std::error::Error>> {
-//     // Creating the mpsc thread message sender(multiple) and receiver(single)
-//     let (kafka_thread_sender, kafka_thread_receiver) = channel(100);
+async fn _run_threads(
+    pool: Pool<Postgres>,
+    app_configuration: NinoverseCoreConfiguration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Creating the mpsc thread message sender(multiple) and receiver(single)
+    let (kafka_thread_sender, kafka_thread_receiver) = channel(100);
 
-//     // Creating the Arc pointers for shared objects
-//     let pool = Arc::new(pool);
-//     let app_configuration = Arc::new(app_configuration);
-//     let kafka_thread_sender = Arc::new(kafka_thread_sender);
+    // Creating the Arc pointers for shared objects
+    let pool = Arc::new(pool);
+    let app_configuration = Arc::new(app_configuration);
+    let kafka_thread_sender = Arc::new(kafka_thread_sender);
 
-//     // Cloning the Arc pointers to pass them to the thread
-//     let app_configuration_cloned = Arc::clone(&app_configuration);
-//     let kafka_thread_sender_cloned = Arc::clone(&kafka_thread_sender);
+    // Cloning the Arc pointers to pass them to the thread
+    let app_configuration_cloned = Arc::clone(&app_configuration);
+    let kafka_thread_sender_cloned = Arc::clone(&kafka_thread_sender);
 
-//     // Starting webserver thread
-//     let api_listener_thread_handler = tokio::spawn(async move {
-//         info!(["RUN_THREADS"], "Starting API listener thread.");
-//         let _ = init_request_handler(
-//             &pool,
-//             &app_configuration_cloned,
-//             &kafka_thread_sender_cloned,
-//         )
-//         .expect("RUN_THREADS: Error in the HTTP Server.")
-//         .await;
-//     });
+    // Starting webserver thread
+    let api_listener_thread_handler = tokio::spawn(async move {
+        info!(["RUN_THREADS"], "Starting API listener thread.");
+        let _ = init_request_handler(
+            &pool,
+            &app_configuration_cloned,
+            &kafka_thread_sender_cloned,
+        )
+        .expect("RUN_THREADS: Error in the HTTP Server.")
+        .await;
+    });
 
-//     // Cloning the Arc pointers to pass them to the thread
-//     let app_configuration_cloned = Arc::clone(&app_configuration);
+    // Cloning the Arc pointers to pass them to the thread
+    let app_configuration_cloned = Arc::clone(&app_configuration);
 
-//     // Starting kafka thread
-//     let kafka_thread_handler = tokio::spawn(async move {
-//         info!(["RUN_THREADS"], "Starting KAFKA thread.");
-//         init_kafka(app_configuration_cloned, kafka_thread_receiver).await;
-//     });
+    // Starting kafka thread
+    let kafka_thread_handler = tokio::spawn(async move {
+        info!(["RUN_THREADS"], "Starting KAFKA thread.");
+        init_kafka(app_configuration_cloned, kafka_thread_receiver).await;
+    });
 
-//     // Start the threads
-//     if let Err(joined_threads_error) =
-//         tokio::try_join!(api_listener_thread_handler, kafka_thread_handler)
-//     {
-//         error!(
-//             ["RUN_THREADS"],
-//             "Some error occured in a thread: {}", joined_threads_error
-//         )
-//     }
-//     Ok(())
-// }
+    // Start the threads
+    if let Err(joined_threads_error) =
+        tokio::try_join!(api_listener_thread_handler, kafka_thread_handler)
+    {
+        error!(
+            ["RUN_THREADS"],
+            "Some error occured in a thread: {}", joined_threads_error
+        )
+    }
+
+    info!(["MAIN"], "Orchestrator running, press Ctrl+C to stop.");
+
+    Ok(())
+}

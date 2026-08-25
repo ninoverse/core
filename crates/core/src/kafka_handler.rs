@@ -16,7 +16,9 @@ use futures::{StreamExt, channel::oneshot::Canceled, stream::FuturesUnordered};
 
 use tokio::sync::mpsc::Receiver;
 
-use crate::{configuration::Configuration, debug, error, info, warn};
+use configuration::NinoverseCoreConfiguration;
+
+use logger::{debug, error, info, warn};
 
 pub struct KafkaBrokerContext {}
 
@@ -77,7 +79,7 @@ fn log_delivery_outcome(outcome: Result<OwnedDeliveryResult, Canceled>) {
 }
 
 async fn create_kafka_admin_client(
-    app_configuration: &Configuration,
+    app_configuration: &NinoverseCoreConfiguration,
 ) -> Result<AdminClient<KafkaBrokerContext>, KafkaError> {
     info!(["ADMIN_CLIENT_CREATION"], "Creating admin client.");
     match ClientConfig::new()
@@ -103,7 +105,7 @@ async fn create_kafka_admin_client(
 
 async fn init_kafka_topics(
     admin_client: AdminClient<KafkaBrokerContext>,
-    app_configuration: &Configuration,
+    app_configuration: &NinoverseCoreConfiguration,
 ) {
     info!(["TOPIC_CREATION"], "Creating topics object.");
     let kafka_topics = &app_configuration.kafka.topics;
@@ -157,7 +159,7 @@ async fn init_kafka_topics(
 }
 
 pub async fn init_kafka(
-    app_configuration: Arc<Configuration>,
+    app_configuration: Arc<NinoverseCoreConfiguration>,
     kafka_thread_receiver: Receiver<KafkaChannelMessage>,
 ) {
     let admin_client = match create_kafka_admin_client(&app_configuration).await {
@@ -192,7 +194,9 @@ pub async fn init_kafka(
     }
 }
 
-async fn init_kafka_consumer(app_configuration: &Configuration) -> Result<(), KafkaError> {
+async fn init_kafka_consumer(
+    app_configuration: &NinoverseCoreConfiguration,
+) -> Result<(), KafkaError> {
     let consumer = create_kafka_consumer(app_configuration).await?;
     info!(["CONSUMER"], "Thread started, consuming stream.");
 
@@ -215,7 +219,7 @@ async fn init_kafka_consumer(app_configuration: &Configuration) -> Result<(), Ka
 }
 
 async fn create_kafka_consumer(
-    app_configuration: &Configuration,
+    app_configuration: &NinoverseCoreConfiguration,
 ) -> Result<StreamConsumer, KafkaError> {
     info!(["CONSUMER_CREATION"], "Creating consumer.");
     let consumer: StreamConsumer = ClientConfig::new()
@@ -261,7 +265,7 @@ async fn create_kafka_consumer(
 
 async fn init_kafka_producer(
     mut kafka_thread_receiver: Receiver<KafkaChannelMessage>,
-    app_configuration: &Configuration,
+    app_configuration: &NinoverseCoreConfiguration,
 ) -> Result<(), KafkaError> {
     let producer = create_kafka_producer(app_configuration).await?;
     info!(["PRODUCER"], "Thread started, ready to send messages.");
@@ -305,7 +309,7 @@ async fn init_kafka_producer(
 }
 
 async fn create_kafka_producer(
-    app_configuration: &Configuration,
+    app_configuration: &NinoverseCoreConfiguration,
 ) -> Result<FutureProducer, KafkaError> {
     info!(["PRODUCER_CREATION"], "Creating producer.");
     let producer: FutureProducer = ClientConfig::new()

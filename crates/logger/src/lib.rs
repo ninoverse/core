@@ -4,8 +4,6 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
-use crate::warn;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(dead_code)]
 pub enum LogLevel {
@@ -61,7 +59,7 @@ fn print_stdout(log_item: LogMessage) {
     println!(
         "{} | {} | {} | {}",
         now,
-        log_item.level.to_string(),
+        log_item.level,
         log_item.decorator.join(" - "),
         log_item.message
     )
@@ -73,7 +71,7 @@ fn print_stderr(log_item: LogMessage) {
     eprintln!(
         "{} | {} | {} | {}",
         now,
-        log_item.level.to_string(),
+        log_item.level,
         log_item.decorator.join(" - "),
         log_item.message
     )
@@ -94,63 +92,63 @@ pub fn log(message: &str, level: LogLevel, decorator: Option<Vec<String>>) {
 #[macro_export]
 macro_rules! debug {
     ([$($dec:expr),*], $msg:expr) => {
-        $crate::logger::log($msg, $crate::logger::LogLevel::Debug, Some(vec![$($dec.to_string()),*]))
+        $crate::log($msg, $crate::LogLevel::Debug, Some(vec![$($dec.to_string()),*]))
     };
     ([$($dec:expr),*], $msg:expr, $($arg:tt)*) => {
-        $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Debug, Some(vec![$($dec.to_string()),*]))
+        $crate::log(&format!($msg, $($arg)*), $crate::LogLevel::Debug, Some(vec![$($dec.to_string()),*]))
     };
     ($msg:expr) => {
-        $crate::logger::log($msg, $crate::logger::LogLevel::Debug, None)
+        $crate::log($msg, $crate::LogLevel::Debug, None)
     };
     ($msg:expr, $($arg:tt)*) => {
-        $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Debug, None)
+        $crate::log(&format!($msg, $($arg)*), $crate::LogLevel::Debug, None)
     };
 }
 
 #[macro_export]
 macro_rules! info {
     ([$($dec:expr),*], $msg:expr) => {
-        $crate::logger::log($msg, $crate::logger::LogLevel::Info, Some(vec![$($dec.to_string()),*]))
+        $crate::log($msg, $crate::LogLevel::Info, Some(vec![$($dec.to_string()),*]))
     };
     ([$($dec:expr),*], $msg:expr, $($arg:tt)*) => {
-        $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Info, Some(vec![$($dec.to_string()),*]))
+        $crate::log(&format!($msg, $($arg)*), $crate::LogLevel::Info, Some(vec![$($dec.to_string()),*]))
     };
     ($msg:expr) => {
-        $crate::logger::log($msg, $crate::logger::LogLevel::Info, None)
+        $crate::log($msg, $crate::LogLevel::Info, None)
     };
     ($msg:expr, $($arg:tt)*) => {
-        $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Info, None)
+        $crate::log(&format!($msg, $($arg)*), $crate::LogLevel::Info, None)
     };
 }
 
 #[macro_export]
 macro_rules! warn {
     ([$($dec:expr),*], $msg:expr) => {
-        $crate::logger::log($msg, $crate::logger::LogLevel::Warn, Some(vec![$($dec.to_string()),*]))
+        $crate::log($msg, $crate::LogLevel::Warn, Some(vec![$($dec.to_string()),*]))
     };
     ([$($dec:expr),*], $msg:expr, $($arg:tt)*) => {
-        $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Warn, Some(vec![$($dec.to_string()),*]))
+        $crate::log(&format!($msg, $($arg)*), $crate::LogLevel::Warn, Some(vec![$($dec.to_string()),*]))
     };
     ($msg:expr) => {
-        $crate::logger::log($msg, $crate::logger::LogLevel::Warn, None)
+        $crate::log($msg, $crate::LogLevel::Warn, None)
     };
     ($msg:expr, $($arg:tt)*) => {
-        $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Warn, None)
+        $crate::log(&format!($msg, $($arg)*), $crate::LogLevel::Warn, None)
     };
 }
 
 #[macro_export]
 macro_rules! error {
     ([$($dec:expr),*], $msg:expr) => {
-        $crate::logger::log($msg, $crate::logger::LogLevel::Error, Some(vec![$($dec.to_string()),*]))
+        $crate::log($msg, $crate::LogLevel::Error, Some(vec![$($dec.to_string()),*]))
     };
     ([$($dec:expr),*], $msg:expr, $($arg:tt)*) => {
-        $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Error, Some(vec![$($dec.to_string()),*]))
+        $crate::log(&format!($msg, $($arg)*), $crate::LogLevel::Error, Some(vec![$($dec.to_string()),*]))
     };
     ($msg:expr) => {
-        $crate::logger::log($msg, $crate::logger::LogLevel::Error, None)
+        $crate::log($msg, $crate::LogLevel::Error, None)
     };
     ($msg:expr, $($arg:tt)*) => {
-        $crate::logger::log(&format!($msg, $($arg)*), $crate::logger::LogLevel::Error, None)
+        $crate::log(&format!($msg, $($arg)*), $crate::LogLevel::Error, None)
     };
 }

@@ -1,23 +1,14 @@
-use crate::{error, info};
+use logger::{info, warn};
 
-use crate::configuration::Configuration;
+use configuration::NinoverseCoreConfiguration;
 
-use sqlx::{Connection, PgConnection, Executor};
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{
-    Pool, Postgres,
-    postgres::PgPoolOptions,
-};
-// use thiserror::Error;
+use sqlx::{Connection, Executor, PgConnection};
+use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
 
-// #[derive(Error, Debug)]
-
-// pub enum PostgresModuleError {
-//     #[error("Sqlx(postgres) error")]
-//     SQLXError(#[from] sqlx::Error),
-// }
-
-pub async fn init_db(app_configuration: &Configuration) -> Result<Pool<Postgres>, sqlx::Error> {
+pub async fn init_db(
+    app_configuration: &NinoverseCoreConfiguration,
+) -> Result<Pool<Postgres>, sqlx::Error> {
     let mut last_err = None;
     for attempt in 1..=5 {
         match get_pool(app_configuration).await {
@@ -31,7 +22,16 @@ pub async fn init_db(app_configuration: &Configuration) -> Result<Pool<Postgres>
                 return Ok(pool);
             }
             Err(postgres_get_pool_error) => {
-                error!(["DB_INIT"], "Attempt {}/{} failed: {}", attempt, app_configuration.database.connection_attempt, postgres_get_pool_error);
+                warn!(
+                    ["DB_INIT"],
+                    "Attempt {}/{} failed ({}:{}/{}): {}",
+                    attempt,
+                    app_configuration.database.connection_attempt,
+                    app_configuration.database.host,
+                    app_configuration.database.port,
+                    app_configuration.database.name,
+                    postgres_get_pool_error
+                );
                 last_err = Some(postgres_get_pool_error);
                 tokio::time::sleep(std::time::Duration::from_secs(attempt * 2)).await;
             }
@@ -40,19 +40,23 @@ pub async fn init_db(app_configuration: &Configuration) -> Result<Pool<Postgres>
     Err(last_err.unwrap())
 }
 
-async fn get_pool(app_configuration: &Configuration) -> Result<Pool<Postgres>, sqlx::Error> {
+async fn get_pool(
+    app_configuration: &NinoverseCoreConfiguration,
+) -> Result<Pool<Postgres>, sqlx::Error> {
     let conection_option = PgConnectOptions::new()
         .host(&app_configuration.database.host)
         .port(app_configuration.database.port)
         .username(&app_configuration.database.user)
         .password(&app_configuration.database.password);
 
-    let mut admin_connection = PgConnection::connect_with(&conection_option.clone().database("postgres")).await?;
+    let mut admin_connection =
+        PgConnection::connect_with(&conection_option.clone().database("postgres")).await?;
 
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
-        .bind(&app_configuration.database.name)
-        .fetch_one(&mut admin_connection)
-        .await?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&app_configuration.database.name)
+            .fetch_one(&mut admin_connection)
+            .await?;
 
     if !exists {
         info!(["DB_INIT"], "Database does not exist, creating...");
