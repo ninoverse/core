@@ -11,8 +11,9 @@ configuration = { path = "../configuration" }
 tokio = { version = "1.52.3", features = [
     "macros",
     "rt-multi-thread",
-    # "sync",
-    # "time",
+    "signal",
+    "sync",
+    "time",
 ] }
 chrono = "0.4.45"
 config = "0.15.25"

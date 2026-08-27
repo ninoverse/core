@@ -21,7 +21,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::{Barrier, broadcast::Sender, watch},
+    sync::{Barrier, broadcast::Sender, mpsc, watch},
     task::JoinSet,
     time::{Duration, sleep},
 };
@@ -146,13 +146,13 @@ pub enum DockerModuleError {
     #[error("Compose file directory not found: {0}")]
     ComposeFileDirectoryNotFound(String),
 
-    #[error("Failed to read the file")]
+    #[error("Failed to read the file: {0}")]
     Read(#[from] std::io::Error),
 
-    #[error("Failed to parse the yaml content")]
+    #[error("Failed to parse the yaml content: {0}")]
     Parse(#[from] serde_yaml::Error),
 
-    #[error("Bollard(docker) error")]
+    #[error("Bollard(docker) error: {0}")]
     Bollard(#[from] bollard::errors::Error),
 
     #[error("Invalid volume specification: {0}")]
@@ -166,6 +166,9 @@ pub enum DockerModuleError {
 
     #[error("Dependency cycle detected among services: {0}")]
     DependencyCycle(String),
+
+    #[error("Service [{0}] did not reach a running state in time")]
+    ServiceStartTimeout(String),
 }
 
 fn resolve_pull_tag(image_reference: &str) -> Option<String> {
@@ -767,6 +770,11 @@ pub async fn start_docker_container(
     let barrier = Arc::new(Barrier::new(docker_services.len() + 1));
     let mut startup_shutdown_receiver = shutdown_broadcast_sender.subscribe();
 
+    // A task that fails to boot never reaches the barrier, so the barrier alone
+    // would hang startup forever. Failures are reported here instead.
+    let (failure_sender, mut failure_receiver) =
+        mpsc::channel::<DockerModuleError>(docker_services.len().max(1));
+
     // One readiness channel per service. Producers publish `Started`; dependents
     // subscribe to the channels of the services they depend on.
     let mut status_senders: HashMap<String, watch::Sender<ServiceStatus>> = HashMap::new();
@@ -780,6 +788,7 @@ pub async fn start_docker_container(
     for (service_name, service_config) in docker_services {
         let barrier_cloned = barrier.clone();
         let docker_cloned = docker.clone();
+        let failure_sender = failure_sender.clone();
         let mut shutdown_broadcast_sender_subscribed = shutdown_broadcast_sender.subscribe();
 
         let status_sender = status_senders
@@ -832,7 +841,15 @@ pub async fn start_docker_container(
             }
 
             tokio::select! {
-                _ = boot_service(&docker_cloned, &service_name, service_config) => {}
+                boot_result = boot_service(&docker_cloned, &service_name, service_config) => {
+                    // `boot_service` already logged the cause. Report it upward so
+                    // startup aborts; dropping `status_sender` on the way out lets
+                    // dependents resolve their wait with an error instead of hanging.
+                    if let Err(boot_error) = boot_result {
+                        let _ = failure_sender.send(boot_error).await;
+                        return;
+                    }
+                }
                 _ = shutdown_broadcast_sender_subscribed.recv() => {
                     info!(
                         ["DOCKER_SHUTDOWN"],
@@ -892,6 +909,9 @@ pub async fn start_docker_container(
         _ = barrier.wait() => {
             info!(["DOCKER_INIT"], "All Docker definitions are up");
         }
+        Some(boot_error) = failure_receiver.recv() => {
+            return Err(boot_error);
+        }
         _ = startup_shutdown_receiver.recv() => {
             info!(
                 ["DOCKER_INIT"],
@@ -902,7 +922,11 @@ pub async fn start_docker_container(
     Ok(())
 }
 
-async fn boot_service(docker: &Docker, service_name: &str, service_config: ServiceConfig) {
+async fn boot_service(
+    docker: &Docker,
+    service_name: &str,
+    service_config: ServiceConfig,
+) -> Result<(), DockerModuleError> {
     info!(
         ["DOCKER_INIT"],
         "Booting up service: {} (Image: {:?})", service_name, service_config.image
@@ -927,18 +951,19 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
         let mut port_bindings = HashMap::new();
         for port_mapping in ports {
             let parts: Vec<&str> = port_mapping.split(':').collect();
-            if parts.len() == 2 {
-                let host_port = parts[0].to_string();
-                let container_port = format!("{}/tcp", parts[1]);
+            let (host_ip, host_port, container_port) = match parts.as_slice() {
+                [host_port, container_port] => ("0.0.0.0", *host_port, *container_port),
+                [host_ip, host_port, container_port] => (*host_ip, *host_port, *container_port),
+                _ => continue,
+            };
 
-                port_bindings.insert(
-                    container_port,
-                    Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".to_string()),
-                        host_port: Some(host_port),
-                    }]),
-                );
-            }
+            port_bindings.insert(
+                format!("{}/tcp", container_port),
+                Some(vec![PortBinding {
+                    host_ip: Some(host_ip.to_string()),
+                    host_port: Some(host_port.to_string()),
+                }]),
+            );
         }
         host_config.port_bindings = Some(port_bindings);
     }
@@ -1011,8 +1036,12 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
                         );
                     }
                 }
-                Err(e) => {
-                    panic!("Fatal error pulling image [{}]: {}", image_name, e);
+                Err(image_pull_error) => {
+                    error!(
+                        ["DOCKER_IMAGES"],
+                        "Fatal error pulling image [{}]: {}", image_name, image_pull_error
+                    );
+                    return Err(image_pull_error.into());
                 }
             }
         }
@@ -1035,11 +1064,12 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
                 "Warning: Container [{}] exists, proceeding anyway...", &service_name
             );
         }
-        Err(volume_creation_error) => {
-            panic!(
-                "Failed to create container [{}]: {}",
-                service_name, volume_creation_error
+        Err(container_creation_error) => {
+            error!(
+                ["DOCKER_INIT"],
+                "Failed to create container [{}]: {}", service_name, container_creation_error
             );
+            return Err(container_creation_error.into());
         }
     };
 
@@ -1053,11 +1083,11 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
                 ["DOCKER_INIT"],
                 "Container [{}] started successfully, waiting for healthy state.", &service_name
             );
-            loop {
+            let mut launched = false;
+            for _ in 0..DEPENDENCY_WAIT_MAX_ATTEMPTS {
                 let inspect = docker
                     .inspect_container(service_name, None::<InspectContainerOptions>)
-                    .await
-                    .unwrap();
+                    .await?;
                 if let Some(state) = inspect.state {
                     let running = state.running.unwrap_or(false);
                     // A short-lived container (e.g. a `service_completed_successfully`
@@ -1068,10 +1098,21 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
                         Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD)
                     );
                     if running || terminal {
+                        launched = true;
                         break;
                     }
                 }
-                sleep(Duration::from_secs(1)).await;
+                sleep(DEPENDENCY_POLL_INTERVAL).await;
+            }
+
+            if !launched {
+                error!(
+                    ["DOCKER_INIT"],
+                    "Container [{}] did not reach a running state in time.", &service_name
+                );
+                return Err(DockerModuleError::ServiceStartTimeout(
+                    service_name.to_string(),
+                ));
             }
         }
         Err(bollard::errors::Error::DockerResponseServerError { status_code, .. })
@@ -1082,13 +1123,16 @@ async fn boot_service(docker: &Docker, service_name: &str, service_config: Servi
                 "Warning: Container [{}] exists, proceeding anyway...", &service_name
             );
         }
-        Err(volume_creation_error) => {
-            panic!(
-                "Failed to start container [{}]: {}",
-                service_name, volume_creation_error
+        Err(container_start_error) => {
+            error!(
+                ["DOCKER_INIT"],
+                "Failed to start container [{}]: {}", service_name, container_start_error
             );
+            return Err(container_start_error.into());
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, dev::Server, get, post
 use sqlx::{Pool, Postgres};
 use tokio::sync::mpsc::Sender;
 
+use crate::error::CoreResult;
 use crate::kafka_handler::KafkaChannelMessage;
 use configuration::NinoverseCoreConfiguration;
 
@@ -9,7 +10,7 @@ pub fn init_request_handler(
     pool: &Pool<Postgres>,
     app_configuration: &NinoverseCoreConfiguration,
     kafka_thread_sender: &Sender<KafkaChannelMessage>,
-) -> Result<Server, Box<dyn std::error::Error>> {
+) -> CoreResult<Server> {
     let pool_cloned = pool.clone();
     let kafka_thread_sender_cloned = kafka_thread_sender.clone();
     Ok(HttpServer::new(move || {
