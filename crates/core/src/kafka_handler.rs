@@ -7,18 +7,19 @@ use rdkafka::{
     admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
     client::ClientContext,
     consumer::{Consumer, StreamConsumer},
-    error::KafkaError,
     producer::{FutureProducer, FutureRecord, future_producer::OwnedDeliveryResult},
     types::RDKafkaErrorCode,
 };
 
 use futures::{StreamExt, channel::oneshot::Canceled, stream::FuturesUnordered};
 
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::{broadcast, mpsc::Receiver};
 
 use configuration::NinoverseCoreConfiguration;
 
 use logger::{debug, error, info, warn};
+
+use crate::error::{CoreResult, KafkaError, KafkaResult};
 
 pub struct KafkaBrokerContext {}
 
@@ -80,7 +81,7 @@ fn log_delivery_outcome(outcome: Result<OwnedDeliveryResult, Canceled>) {
 
 async fn create_kafka_admin_client(
     app_configuration: &NinoverseCoreConfiguration,
-) -> Result<AdminClient<KafkaBrokerContext>, KafkaError> {
+) -> KafkaResult<AdminClient<KafkaBrokerContext>> {
     info!(["ADMIN_CLIENT_CREATION"], "Creating admin client.");
     match ClientConfig::new()
         .set("bootstrap.servers", &app_configuration.kafka.broker)
@@ -98,7 +99,7 @@ async fn create_kafka_admin_client(
                 ["ADMIN_CLIENT_CREATION"],
                 "Failed to create AdminClient with custom context"
             );
-            Err(admin_client_error)
+            Err(KafkaError::RDKafka(admin_client_error))
         }
     }
 }
@@ -106,7 +107,7 @@ async fn create_kafka_admin_client(
 async fn init_kafka_topics(
     admin_client: AdminClient<KafkaBrokerContext>,
     app_configuration: &NinoverseCoreConfiguration,
-) {
+) -> KafkaResult<()> {
     info!(["TOPIC_CREATION"], "Creating topics object.");
     let kafka_topics = &app_configuration.kafka.topics;
     let kafka_new_topics: Vec<NewTopic<'_>> = kafka_topics
@@ -124,7 +125,7 @@ async fn init_kafka_topics(
             ["TOPIC_CREATION"],
             "No topic created (no topic creation configured)."
         );
-        return;
+        return Err(KafkaError::NoTopicInConfiguration);
     }
 
     let options = AdminOptions::new();
@@ -141,19 +142,24 @@ async fn init_kafka_topics(
                         RDKafkaErrorCode::TopicAlreadyExists => {
                             warn!(["TOPIC_CREATION"], "Topic '{}' already exists", topic)
                         }
-                        other => error!(
-                            ["TOPIC_CREATION"],
-                            "Topic '{}' creation failed -> {:#?}", topic, other
-                        ),
+                        other => {
+                            error!(
+                                ["TOPIC_CREATION"],
+                                "Topic '{}' creation failed -> {:#?}", topic, other
+                            );
+                            return Err(KafkaError::ErrorCode(other));
+                        }
                     },
                 }
             }
+            Ok(())
         }
         Err(topic_creation_error) => {
             error!(
                 ["TOPIC_CREATION"],
                 "Topic creation failed: {}", topic_creation_error
             );
+            Err(KafkaError::RDKafka(topic_creation_error))
         }
     }
 }
@@ -161,49 +167,82 @@ async fn init_kafka_topics(
 pub async fn init_kafka(
     app_configuration: Arc<NinoverseCoreConfiguration>,
     kafka_thread_receiver: Receiver<KafkaChannelMessage>,
-) {
+    shutdown_broadcast_sender: &broadcast::Sender<()>,
+) -> CoreResult<()> {
+    // Subscribe before the first await: a `broadcast::Receiver` only sees values
+    // sent after it subscribed, so subscribing later could miss a shutdown that
+    // arrives during admin-client or topic setup and leave these tasks running.
+    let mut topic_shutdown_receiver = shutdown_broadcast_sender.subscribe();
+    let mut consumer_shutdown_receiver = shutdown_broadcast_sender.subscribe();
+    let mut producer_shutdown_receiver = shutdown_broadcast_sender.subscribe();
+
     let admin_client = match create_kafka_admin_client(&app_configuration).await {
         Ok(client) => client,
-        Err(_) => {
+        Err(admin_client_creation_error) => {
             error!(["INIT_KAFKA"], "Admin client creation failed");
-            return;
+            return Err(admin_client_creation_error.into());
         }
     };
-    init_kafka_topics(admin_client, &app_configuration).await;
+
+    tokio::select! {
+        topic_result = init_kafka_topics(admin_client, &app_configuration) => topic_result?,
+        _ = topic_shutdown_receiver.recv() => {
+            info!(
+                ["INIT_KAFKA"],
+                "Shutdown requested during topic creation. Aborting Kafka startup."
+            );
+            return Ok(());
+        }
+    }
 
     let app_configuration_cloned = app_configuration.clone();
     let consumer_handle = tokio::spawn(async move {
         // TODO: Add retries
-        if let Err(consumer_error) = init_kafka_consumer(&app_configuration_cloned).await {
-            error!(["INIT_KAFKA"], "Consumer terminated: {}", consumer_error);
-        }
+        init_kafka_consumer(&app_configuration_cloned, &mut consumer_shutdown_receiver).await
     });
 
     let app_configuration_cloned = app_configuration.clone();
     let producer_handle = tokio::spawn(async move {
         // TODO: Add retries
-        if let Err(producer_error) =
-            init_kafka_producer(kafka_thread_receiver, &app_configuration_cloned).await
-        {
-            error!(["INIT_KAFKA"], "Producer terminated: {}", producer_error);
-        }
+        init_kafka_producer(
+            kafka_thread_receiver,
+            &app_configuration_cloned,
+            &mut producer_shutdown_receiver,
+        )
+        .await
     });
 
-    if let Err(join_error) = tokio::try_join!(consumer_handle, producer_handle) {
-        error!(["INIT_KAFKA"], "Kafka task join error: {}", join_error);
+    match tokio::try_join!(consumer_handle, producer_handle) {
+        Ok((consumer_result, producer_result)) => {
+            if let Err(consumer_error) = &consumer_result {
+                error!(["INIT_KAFKA"], "Consumer terminated: {}", consumer_error);
+            }
+            if let Err(producer_error) = &producer_result {
+                error!(["INIT_KAFKA"], "Producer terminated: {}", producer_error);
+            }
+            consumer_result?;
+            producer_result?;
+            Ok(())
+        }
+        Err(join_error) => {
+            error!(["INIT_KAFKA"], "Kafka task join error: {}", join_error);
+            Err(join_error.into())
+        }
     }
 }
 
 async fn init_kafka_consumer(
     app_configuration: &NinoverseCoreConfiguration,
-) -> Result<(), KafkaError> {
+    shutdown_receiver: &mut broadcast::Receiver<()>,
+) -> KafkaResult<()> {
     let consumer = create_kafka_consumer(app_configuration).await?;
     info!(["CONSUMER"], "Thread started, consuming stream.");
 
-    consumer
-        .stream()
-        .for_each(|message_result| async {
-            match message_result {
+    loop {
+        tokio::select! {
+            // `StreamConsumer::recv` is cancel-safe, so losing this branch to the
+            // shutdown arm cannot drop an already-acknowledged message.
+            message_result = consumer.recv() => match message_result {
                 Ok(borrowed_message) => log_kafka_message(borrowed_message.detach()).await,
                 Err(consumer_error) => {
                     error!(
@@ -211,16 +250,20 @@ async fn init_kafka_consumer(
                         "Stream error (continuing): {}", consumer_error
                     )
                 }
+            },
+            _ = shutdown_receiver.recv() => {
+                info!(["CONSUMER"], "Shutdown signal received. Stopping consumer.");
+                break;
             }
-        })
-        .await;
+        }
+    }
 
     Ok(())
 }
 
 async fn create_kafka_consumer(
     app_configuration: &NinoverseCoreConfiguration,
-) -> Result<StreamConsumer, KafkaError> {
+) -> KafkaResult<StreamConsumer> {
     info!(["CONSUMER_CREATION"], "Creating consumer.");
     let consumer: StreamConsumer = ClientConfig::new()
         .set("group.id", &app_configuration.kafka.group_id)
@@ -258,7 +301,7 @@ async fn create_kafka_consumer(
         }
         Err(consumer_subscription_error) => {
             error!(["CONSUMER_CREATION"], "Can't subscribe to topics");
-            Err(consumer_subscription_error)
+            Err(KafkaError::RDKafka(consumer_subscription_error))
         }
     }
 }
@@ -266,7 +309,8 @@ async fn create_kafka_consumer(
 async fn init_kafka_producer(
     mut kafka_thread_receiver: Receiver<KafkaChannelMessage>,
     app_configuration: &NinoverseCoreConfiguration,
-) -> Result<(), KafkaError> {
+    shutdown_receiver: &mut broadcast::Receiver<()>,
+) -> KafkaResult<()> {
     let producer = create_kafka_producer(app_configuration).await?;
     info!(["PRODUCER"], "Thread started, ready to send messages.");
 
@@ -298,6 +342,14 @@ async fn init_kafka_producer(
             Some(outcome) = in_flight.next(), if !in_flight.is_empty() => {
                 log_delivery_outcome(outcome);
             }
+
+            _ = shutdown_receiver.recv() => {
+                info!(
+                    ["PRODUCER"],
+                    "Shutdown signal received. Draining in-flight messages."
+                );
+                break;
+            }
         }
     }
 
@@ -310,7 +362,7 @@ async fn init_kafka_producer(
 
 async fn create_kafka_producer(
     app_configuration: &NinoverseCoreConfiguration,
-) -> Result<FutureProducer, KafkaError> {
+) -> KafkaResult<FutureProducer> {
     info!(["PRODUCER_CREATION"], "Creating producer.");
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &app_configuration.kafka.broker)

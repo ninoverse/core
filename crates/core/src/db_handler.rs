@@ -10,7 +10,7 @@ pub async fn init_db(
     app_configuration: &NinoverseCoreConfiguration,
 ) -> Result<Pool<Postgres>, sqlx::Error> {
     let mut last_err = None;
-    for attempt in 1..=5 {
+    for attempt in 1..=app_configuration.database.connection_attempt {
         match get_pool(app_configuration).await {
             Ok(pool) => {
                 info!(
@@ -33,11 +33,13 @@ pub async fn init_db(
                     postgres_get_pool_error
                 );
                 last_err = Some(postgres_get_pool_error);
-                tokio::time::sleep(std::time::Duration::from_secs(attempt * 2)).await;
+                tokio::time::sleep(std::time::Duration::from_secs((attempt * 2).into())).await;
             }
         }
     }
-    Err(last_err.unwrap())
+    // `connection_attempt == 0` skips the loop entirely, leaving no error to report.
+    Err(last_err
+        .unwrap_or_else(|| sqlx::Error::Configuration("database.connection_attempt is 0".into())))
 }
 
 async fn get_pool(
