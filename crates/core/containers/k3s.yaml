@@ -1,0 +1,51 @@
+services:
+  k3s-server:
+    image: rancher/k3s:latest
+    command: server
+    tmpfs:
+      - /run
+      - /var/run
+    privileged: true
+    restart: always
+    environment:
+      - K3S_DATASTORE_ENDPOINT=http://etcd:2379 
+      - K3S_TOKEN=my-super-secret-token
+    volumes:
+      - k3s-server-data:/var/lib/rancher/k3s
+    ports:
+      - "6443:6443"
+    networks:
+      - etcd-backend
+      - k3s-server-network
+    depends_on:
+      - etcd
+
+  k3s-agent:
+    image: rancher/k3s:latest
+    command: agent
+    tmpfs:
+      - /run
+      - /var/run
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    privileged: true
+    restart: always
+    environment:
+      - K3S_URL=https://k3s-server:6443
+      - K3S_TOKEN=my-super-secret-token
+    volumes:
+      - k3s-agent-data:/var/lib/rancher/k3s
+    networks: 
+      - k3s-server-network
+    depends_on:
+      - k3s-server
+  
+volumes:
+  k3s-server-data:
+  k3s-agent-data:
+
+networks:
+  k3s-server-network:

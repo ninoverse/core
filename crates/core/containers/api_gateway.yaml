@@ -1,0 +1,26 @@
+services:
+  apisix:
+    image: apache/apisix:3.18.0-ubuntu
+    container_name: apisix
+    restart: unless-stopped
+    depends_on:
+      etcd:
+        condition: service_started
+    environment:
+      - ADMIN_KEY=admin-secret-key-placeholder
+    volumes:
+      - ./config/apisix.yaml:/usr/local/apisix/conf/config.yaml:ro
+    networks:
+      - ninoverse-network
+      - etcd-backend
+
+  apisix-curl:
+    image: curlimages/curl:8.21.0
+    container_name: apisix-curl
+    restart: unless-stopped
+    depends_on:
+      apisix:
+        condition: service_started
+    command: sleep infinity
+    networks:
+      - ninoverse-network
