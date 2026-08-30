@@ -41,6 +41,9 @@ services:
     mode: "gate"
     priority: 100
     uris:
+      # nora answers "/" with a relative 303 to "/ui/", so the redirect only
+      # works if the gateway routes the bare root here in the first place.
+      - "/"
       - "/ui"
       - "/ui/*"
       - "/api/*"
