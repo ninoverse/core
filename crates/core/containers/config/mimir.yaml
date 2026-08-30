@@ -1,0 +1,25 @@
+target: all
+multitenancy_enabled: false
+
+server:
+  http_listen_port: 9009
+
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: /data/blocks
+  tsdb:
+    dir: /data/ingester
+  bucket_store:
+    sync_dir: /data/tsdb-sync
+
+ingester:
+  ring:
+    kvstore:
+      store: inmemory
+    replication_factor: 1
+
+compactor:
+  sharding_ring:
+    kvstore:
+      store: inmemory   

@@ -1,22 +1,40 @@
 services:
-  init-volume:
-    image: busybox
-    command: 
-      - sh -c "chown -R 8443:8443 /data"
+  init-kanidm-volume:
+    image: busybox:1.38.0
+    container_name: init-kanidm-volume
+    restart: no
+    command: 'sh -c "chown -R 8443:8443 /data"'
     volumes:
       - kanidm-data:/data/
 
   kanidmd:
-    image: kanidm/server:latest
+    image: kanidm/server:1.11.1
     container_name: kanidmd
-    user: "8443:8443"
-    restart: always
+    restart: unless-stopped
     depends_on:
-      init-volume:
+      init-kanidm-volume:
         condition: service_completed_successfully
+    user: "8443:8443"
     volumes:
-      - config/kanidm/server.toml:/data/server.toml:ro
+      - ./config/kanidm/server.toml:/data/server.toml:ro
       - /home/nino/ninoverse/certs:/certs/
       - kanidm-data:/data/
     networks:
       - ninoverse-network
+
+  kanidm-cli:
+    image: kanidm/tools:1.11.1
+    container_name: kanidm-cli
+    restart: unless-stopped
+    depends_on:
+      kanidmd:
+        condition: service_started
+    command: sleep infinity
+    volumes:
+      - kanidm-cli-data:/root/.config
+    networks:
+      - ninoverse-network
+
+volumes:
+  kanidm-data:
+  kanidm-cli-data:

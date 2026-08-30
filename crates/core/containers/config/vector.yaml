@@ -9,15 +9,24 @@ sources:
       address: 0.0.0.0:4317
     http:
       address: 0.0.0.0:4318
-  dummy_logs:
-    type: "demo_logs"
-    format: "json"
-    interval: 1.0
+  os_metrics:
+    type: host_metrics
+  # dummy_logs:
+  #   type: "demo_logs"
+  #   format: "json"
+  #   interval: 1.0
 
 transforms:
+  cleaned_os_metrics:
+    type: filter
+    inputs:
+      - os_metrics
+    condition: 'true'
+
   unified_logs:
     type: remap
-    inputs: [docker_logs, dummy_logs, otel_receiver.logs]
+    inputs: [docker_logs, otel_receiver.logs]
+    # inputs: [docker_logs, dummy_logs, otel_receiver.logs]
     source: |
       .timestamp = now()
 
@@ -40,11 +49,16 @@ transforms:
 
   unified_telemetry:
     type: remap
-    inputs: [otel_receiver.metrics, otel_receiver.traces]
+    inputs: [otel_receiver.metrics, otel_receiver.traces, cleaned_os_metrics]
     source: |
       .timestamp = now()
 
 sinks:
+  # console_out:
+  #   type: "console"
+  #   inputs: ["unified_logs"]
+  #   encoding:
+  #     codec: "json"
   loki_out:
     type: loki
     inputs: [prep_for_loki] 
@@ -60,20 +74,46 @@ sinks:
       max_size: 1048576000
       when_full: block
 
-  victorialogs_out:
-    type: elasticsearch
-    inputs: [unified_logs]
-    endpoints: ["http://victorialogs:9428/insert/elasticsearch/"]
-    api_version: "v8"
-    mode: "bulk"
-    bulk:
-      index: "docker-logs-%Y-%m-%d"
-    buffer:
-      type: disk
-      max_size: 1048576000
-    request:
-      headers:
-        VL-Msg-Field: "message"
+  tempo_out:
+    type: opentelemetry
+    inputs: [otel_receiver.traces]
+    protocol: 
+      type: "http"
+      uri: "http://tempo:4318/v1/traces"
+      encoding:
+        codec: "otlp"
+
+  mimir_out:
+    type: prometheus_remote_write
+    inputs: [otel_receiver.metrics, cleaned_os_metrics]
+    endpoint: http://mimir:9009/api/v1/push
+
+  openobserve_out:
+    type: http
+    inputs: [unified_logs, unified_telemetry]
+    uri: "http://openobserve:5080/api/default/default/_json"
+    method: "post"
+    auth:
+      strategy: "basic"
+      user: "admin@example.com"
+      password: "ComplexPassword123!"
+    encoding:
+      codec: "json"
+
+  # victorialogs_out:
+  #   type: elasticsearch
+  #   inputs: [unified_logs]
+  #   endpoints: ["http://victorialogs:9428/insert/elasticsearch/"]
+  #   api_version: "v8"
+  #   mode: "bulk"
+  #   bulk:
+  #     index: "docker-logs-%Y-%m-%d"
+  #   buffer:
+  #     type: disk
+  #     max_size: 1048576000
+  #   request:
+  #     headers:
+  #       VL-Msg-Field: "message"
 
   # elasticsearch_out:
   #   type: elasticsearch
@@ -98,29 +138,3 @@ sinks:
   #   buffer:
   #     type: disk
   #     max_size: 1048576000
-
-  openobserve_out:
-    type: http
-    inputs: [unified_logs, unified_telemetry]
-    uri: "http://openobserve:5080/api/default/default/_json"
-    method: "post"
-    auth:
-      strategy: "basic"
-      user: "admin@example.com"
-      password: "ComplexPassword123!"
-    encoding:
-      codec: "json"
-  
-  tempo_out:
-    type: opentelemetry
-    inputs: [otel_receiver.traces]
-    protocol: 
-      type: "http"
-      uri: "http://tempo:4318/v1/traces"
-      encoding:
-        codec: "otlp"
-
-  mimir_out:
-    type: prometheus_remote_write
-    inputs: [otel_receiver.metrics]
-    endpoint: http://mimir:9009/api/v1/push

@@ -1,0 +1,86 @@
+services:
+  loki:
+    image: grafana/loki:3.7.6
+    container_name: loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki-data:/loki
+    networks:
+      - ninoverse-network
+
+  tempo:
+    image: grafana/tempo:3.0.3
+    container_name: tempo
+    restart: unless-stopped
+    command: "-config.file=/etc/tempo.yaml"
+    volumes:
+      - ./config/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    networks:
+      - ninoverse-network
+
+  mimir:
+    image: grafana/mimir:3.2.0
+    container_name: mimir
+    restart: unless-stopped
+    command: -config.file=/etc/mimir.yaml -blocks-storage.filesystem.dir=/data/blocks -blocks-storage.tsdb.dir=/data/tsdb -ruler-storage.filesystem.dir=/data/ruler -alertmanager-storage.filesystem.dir=/data/alertmanager -compactor.data-dir=/data/compactor-data
+    volumes:
+      - ./config/mimir.yaml:/etc/mimir.yaml:ro
+      - mimir-data:/data
+    networks:
+      - ninoverse-network
+
+  openobserve:
+    image: public.ecr.aws/zinclabs/openobserve:v0.92.2
+    container_name: openobserve
+    restart: unless-stopped
+    environment:
+      - ZO_ROOT_USER_EMAIL=admin@example.com
+      - ZO_ROOT_USER_PASSWORD=ComplexPassword123!
+      - ZO_LOCAL_MODE=true
+      - ZO_DATA_DIR=/data
+    volumes:
+      - openobserve-data:/data
+    networks:
+      - ninoverse-network
+
+  # victorialogs:
+  #   image: victoriametrics/victoria-logs:v1.52.0
+  #   container_name: victorialogs
+  #   restart: unless-stopped
+  #   command: --retentionPeriod=14d --httpListenAddr=:9428
+  #   volumes:
+  #     - victorialogs-data:/victoria-logs-data
+  #   networks:
+  #     - ninoverse-network
+
+  # opensearch:
+  #   image: opensearchproject/opensearch:3.8.0
+  #   container_name: opensearch
+  #   restart: unless-stopped
+  #   environment:
+  #     - discovery.type=single-node
+  #     - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+  #     - DISABLE_INSTALL_DEMO_CONFIG=true
+  #     - plugins.security.disabled=true # Disabled for easy local testing
+  #   networks:
+  #     - ninoverse-network
+
+  # elasticsearch:
+  #   image: docker.elastic.co/elasticsearch/elasticsearch:9.5.2
+  #   container_name: elasticsearch
+  #   restart: unless-stopped
+  #   environment:
+  #     - discovery.type=single-node
+  #     - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+  #     - xpack.security.enabled=false # Disabled for easy local testing
+  #   networks:
+  #     - ninoverse-network
+
+volumes:
+  loki-data:
+  mimir-data:
+  tempo-data:
+  openobserve-data:
+  # victorialogs-data:

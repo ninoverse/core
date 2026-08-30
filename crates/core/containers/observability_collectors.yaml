@@ -1,0 +1,30 @@
+services:
+  vector:
+    image: timberio/vector:0.57.0-alpine
+    container_name: vector
+    restart: unless-stopped
+    depends_on:
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+      mimir:
+        condition: service_started
+      openobserve:
+        condition: service_started
+      # victorialogs:
+      #   condition: service_started
+      # elasticsearch:
+      #   condition: service_started
+      # opensearch:
+      #   condition: service_started
+    user: root
+    volumes:
+      - ./config/vector.yaml:/etc/vector/vector.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - vector-data:/var/lib/vector
+    networks:
+      - ninoverse-network
+
+volumes:
+  vector-data:

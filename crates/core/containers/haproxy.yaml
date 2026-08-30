@@ -1,13 +1,20 @@
 services:
   haproxy:
-    image: haproxy:latest
+    image: haproxy:3.4.3
     container_name: haproxy_router
+    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
+      - "4317:4317"
+      - "4318:4318"
+      # For now the ports can't define an host, it can be only port:port
+      # - "127.0.0.1:5432:5432"
+      # - "127.0.0.1:9092:9092"
       - "5432:5432"
+      - "9092:9092"
     volumes:
-      - config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - /home/nino/ninoverse/certs/nicolapasqualini.it.pem:/etc/haproxy/certs/nicolapasqualini.it.pem
+      - ./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - /home/nino/ninoverse/certs/nicolapasqualini.it.pem:/etc/haproxy/certs/nicolapasqualini.it.pem:ro
     networks:
       - ninoverse-network

@@ -1,10 +1,14 @@
 services:
   sftp:
-    image: atmoz/sftp
+    # Upstream publishes no version tags, so `latest` (2024-07-14) is pinned by digest.
+    image: atmoz/sftp@sha256:0960390462a4441dbb63698d7c185b76a41ffcee7b78ff4adf275f3e66f9c475
     container_name: sftp-server
+    restart: unless-stopped
     volumes:
       - ninoverse-sftp-data:/home/sftpuser/upload
-    command: 
-      - sftpuser:pass:1000:1000:upload
+    command: sftpuser:pass:1000:1000:upload
     networks:
       - ninoverse-network
+
+volumes:
+  ninoverse-sftp-data:

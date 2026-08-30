@@ -2,7 +2,7 @@
 version = "2"
 
 # The webserver bind address
-bindaddress = "0.0.0.0:8443"
+bindaddress = "[::]:8443"
 
 # The core domain of your identity system (e.g., your base domain)
 domain = "nicolapasqualini.it"

@@ -1,0 +1,23 @@
+services:
+  nora:
+    image: getnora/nora:1.1.0
+    container_name: nora_registry
+    restart: unless-stopped
+    volumes:
+      - nora_data:/data
+    environment:
+      - NORA_HOST=0.0.0.0
+      - NORA_PUBLIC_URL=https://registry.nicolapasqualini.it
+      # Without these nora serves every package, and accepts an unauthenticated
+      # POST /api/v1/admin/reindex, to anyone who can reach it.
+      - NORA_AUTH_ENABLED=true
+      - NORA_AUTH_ANONYMOUS_READ=false
+      - NORA_AUTH_DOCKER_ANON_PULL=false
+      # The UI's own gate stays off; APISIX supplies the identity boundary.
+      - NORA_AUTH_PUBLIC_WEB_UI=true
+      - NORA_AUTH_ADMIN_USERS=nino
+    networks:
+      - ninoverse-network
+
+volumes:
+  nora_data:
