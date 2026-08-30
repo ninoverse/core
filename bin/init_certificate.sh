@@ -1,0 +1,2 @@
+#!/bin/bash
+sudo certbot certonly --expand -d nicolapasqualini.it,registry.nicolapasqualini.it,grafana.nicolapasqualini.it,openobserve.nicolapasqualini.it,sonarqube.nicolapasqualini.it,victorialogs.nicolapasqualini.it,registry.nicolapasqualini.it,api.nicolapasqualini.it,apidashboard.nicolapasqualini.it,auth.nicolapasqualini.it,www.nicolapasqualini.it
