@@ -242,3 +242,11 @@ These are product ideas, not compose-spec gaps.
 
 - **Add Signoz**
 - **Add OpenObserve Plugin to Grafana**
+- **Bring k3s back under the orchestrator.** `containers/standalone/k3s.yaml` is
+  started by `bin/start_k3s.sh` instead, because `ServiceConfig` drops
+  `privileged`, `tmpfs` and `ulimits` (see "Nice to have" above) and k3s cannot
+  boot without them. Moving it back is a straight `git mv` once those land.
+- **Generate headlamp's kubeconfig instead of hand-writing it.** It needs
+  `secrets/OIDC_SECRET_HEADLAMP` and the k3s CA, so it cannot come from a compose
+  file while `${VAR}` interpolation is missing; today it is built by hand into
+  `secrets/headlamp/config`.

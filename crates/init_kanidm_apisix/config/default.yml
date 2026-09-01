@@ -84,6 +84,12 @@ services:
     group: "grafana_users"
     mode: "native"
     native_redirect_url: "https://grafana.nicolapasqualini.it/login/generic_oauth"
+  - client_id: "headlamp"
+    display_name: "Headlamp"
+    subdomain: "headlamp"
+    group: "headlamp_admins"
+    mode: "native"
+    native_redirect_url: "https://headlamp.nicolapasqualini.it/oidc-callback"
 
 persons:
   - name: "nino"
@@ -98,3 +104,4 @@ persons:
       - "sonarqube_users"
       - "openobserve_users"
       - "registry_users"
+      - "headlamp_admins"

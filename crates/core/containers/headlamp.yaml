@@ -1,0 +1,16 @@
+services:
+  headlamp:
+    image: ghcr.io/headlamp-k8s/headlamp:v0.45.0
+    container_name: headlamp
+    restart: unless-stopped
+    environment:
+      - HEADLAMP_CONFIG_KUBECONFIG=/kubeconfig/config
+      - HEADLAMP_CONFIG_OIDC_USE_PKCE=true
+    volumes:
+      # The directory, never the file: docker creates a missing bind source as a
+      # directory, and the kubeconfig cannot exist before the first boot -- it
+      # needs both the kanidm secret and the k3s CA. Its own subdirectory so the
+      # container does not see every other service's secret.
+      - ../../../secrets/headlamp/:/kubeconfig:ro
+    networks:
+      - ninoverse-network
