@@ -19,6 +19,10 @@ Before writing any code:
    If it exists, report the finding and ask: skip / overwrite / modify.
    Never silently overwrite.
 
+3. **Read `TODO.md`** and any `docs/` page covering the area you are about to
+   touch, so you work from current state rather than a stale claim. See
+   `.claude/doc-upkeep.md`.
+
 ---
 
 ## 9-step checklist (one crate, one commit)
@@ -106,6 +110,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace        # falls back to `cargo test --workspace`
 ```
 
+Then reconcile the docs: if this crate makes anything in `TODO.md` or `docs/`
+false, fix it in this same commit (`.claude/doc-upkeep.md`).
+
 ### 9. Commit + push + draft PR
 
 ```
@@ -133,3 +140,6 @@ cargo deny check
 ```
 
 All four must pass cleanly with zero warnings.
+
+Then re-read `TODO.md` and every `docs/` page naming a module this group
+changed, and reconcile before marking the PR ready (`.claude/doc-upkeep.md`).

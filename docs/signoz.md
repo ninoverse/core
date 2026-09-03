@@ -4,6 +4,10 @@
 in the tree today is the bare `# signoz:` placeholder at
 [observability_ui.yaml:14](../crates/core/containers/observability_ui.yaml#L14).
 
+> **Note:** every `crates/core/containers/…` link below resolves only on the
+> `wip/add-docker-definitions-and-configurations` branch. On `main` that
+> directory holds just a `.gitkeep`; the compose definitions are not merged yet.
+
 This document records what SigNoz actually needs, what the repository already
 provides that it can reuse, and the loader gaps that have to close before a
 working definition can be written.
@@ -68,7 +72,8 @@ healthchecks:
 - The collector additionally gates itself on `/signoz-otel-collector migrate sync
   check` succeeding before it starts serving.
 
-None of that is expressible today — see §4.
+The `depends_on` half of that is expressible today; the healthcheck half is not,
+so `condition: service_healthy` currently degrades to "is running" — see §4.
 
 ---
 
@@ -104,8 +109,8 @@ read-only, exactly like the four configs already there:
 
 A `config/signoz/` subdirectory follows the `config/kanidm/` precedent.
 
-> **The `./` prefix is mandatory.** `is_host_path`
-> ([docker.rs:121](../crates/core/src/docker.rs#L121)) classifies a bind source
+> **The `./` prefix is mandatory.** `is_host_path` in
+> [docker.rs](../crates/core/src/docker.rs) classifies a bind source
 > by its prefix — `/`, `./`, `../`, `~`, `~/`. A source written as
 > `config/signoz/cluster.xml` is treated as a *named volume literally called
 > `config/signoz/cluster.xml`*, not a bind. This is precisely the bug the deleted
@@ -188,17 +193,16 @@ will fail.
 - **Co-locate the `volumes:` block** in the same file as the services using it.
   The old central `volumes.yaml` was deliberately dissolved into per-file blocks.
 - **The service key *is* the container name.** `container_name:` is parsed and
-  then discarded ([docker.rs:668](../crates/core/src/docker.rs#L668)); the
-  container is always named after the YAML key. Service keys are therefore a flat
-  global namespace across *every* file in `containers/`. SigNoz's upstream keys
+  then discarded by `boot_service`; the container is always named after the YAML
+  key. Service keys are therefore a flat global namespace across *every* file in
+  `containers/`. SigNoz's upstream keys
   (`clickhouse`, `zookeeper-1`, `otel-collector`) are far too generic for a shared
   network — prefix them: `signoz-clickhouse`, `signoz-zookeeper`,
   `signoz-otel-collector`.
-- **A new file is picked up automatically.** `find_docker_definitions`
-  ([docker.rs:295](../crates/core/src/docker.rs#L295)) globs every `*.yaml` in
-  `containers/` and flattens the three maps; file names carry no meaning and no
-  Rust change is needed to register one. `containers/config/` is skipped because
-  it is a directory, not a file.
+- **A new file is picked up automatically.** `find_docker_definitions` globs
+  every `*.yaml` and `*.yml` in `containers/` and flattens the three maps; file
+  names carry no meaning and no Rust change is needed to register one.
+  `containers/config/` is skipped because it is a directory, not a file.
 
 Because SigNoz brings its own datastore and collector, it does **not** belong in
 `observability_ui.yaml` next to Grafana. A dedicated `signoz.yaml` is the right
@@ -208,18 +212,23 @@ shape, and the `# signoz:` placeholder should be removed when it lands.
 
 ## 4. What blocks a faithful port
 
-`ServiceConfig` ([docker.rs:42-54](../crates/core/src/docker.rs#L42-L54)) supports
-exactly nine keys: `image`, `ports`, `networks`, `volumes`, `environment`,
-`container_name`, `command`, `user` (plus the skipped `mounts`). No struct uses
+Symbols named in this section live in
+[docker.rs](../crates/core/src/docker.rs); they are given as names rather than
+line numbers so the references survive edits.
+
+`ServiceConfig` parses exactly ten compose keys: `image`, `ports`, `networks`,
+`volumes`, `environment`, `container_name`, `command`, `user`, `depends_on`,
+`restart` (plus three `#[serde(skip)]` fields the loader fills in itself —
+`mounts`, `restart_policy`, `command_argv`). No struct uses
 `deny_unknown_fields`, so everything else is **silently dropped** — the failure is
 invisible, not loud.
 
 ### No `entrypoint`
 
 Both one-shot jobs rely on `entrypoint: /bin/sh` + `command: -c '<a && b>'`.
-Here `command` is a single string run through `shlex::split`
-([docker.rs:670](../crates/core/src/docker.rs#L670)), so `&&` arrives as a literal
-argument to the image's own entrypoint rather than being interpreted by a shell.
+Here `command` is a single string run through `shlex::split` in
+`resolve_command`, so `&&` arrives as a literal argument to the image's own
+entrypoint rather than being interpreted by a shell.
 
 - `init-clickhouse` can be worked around: swap the image for one with an empty
   ENTRYPOINT and use `command: 'sh -c "..."'` — the trick `kanidm.yaml`'s
@@ -232,57 +241,61 @@ Adding `entrypoint: Option<String>` to `ServiceConfig` and passing it through to
 `ContainerCreateBody.entrypoint` is a small, contained change that removes this
 entire class of workaround.
 
-### No `depends_on`
+### No `healthcheck`, so `service_healthy` is not a real gate
 
-`depends_on` deserializes into nothing. Every service is spawned concurrently into
-a `JoinSet` ([docker.rs:507](../crates/core/src/docker.rs#L507)) with no ordering
-at all — `kanidm.yaml`'s `depends_on: { init-volume: { condition:
-service_completed_successfully } }` is already being ignored today.
+`depends_on` itself works (see "Resolved since this was written" below), but
+`healthcheck` is not a field on `ServiceConfig`, so a container this loader
+creates never *has* a Docker health state. `wait_for_healthy` reads that state
+for `condition: service_healthy` and, finding none, falls back to "the container
+is running" — which is exactly the gate SigNoz's ordering contract needs to *not*
+be.
 
-In practice the crash watcher ([docker.rs:554](../crates/core/src/docker.rs#L554))
-re-`start`s any non-running container every 5 seconds, so a migrator that starts
-before ClickHouse fails, exits, and is retried until ClickHouse answers. It
-converges — but by retry, not by design, and the logs will show a burst of
-failures on every boot.
+That matters concretely here:
 
-### One-shot containers stall the startup barrier
+- ClickHouse is slow to accept connections after its process starts. `signoz` and
+  the migrator gating on `condition: service_healthy` would be released as soon
+  as ClickHouse is *running*, not when it answers, so the migrator can still lose
+  the race it is supposed to be protected from.
+- The collector's own gate — `/signoz-otel-collector migrate sync check` — is a
+  healthcheck command. There is no way to express it at all.
 
-This is the sharpest edge. After `start_container` succeeds, `boot_service` polls
-until `state.running == true`
-([docker.rs:769-780](../crates/core/src/docker.rs#L769-L780)):
+Parsing `healthcheck` (`test`, `interval`, `timeout`, `retries`, `start_period`,
+`disable`) and passing it to `bollard` is what makes `service_healthy` mean what
+it says. Tracked in [TODO.md](../TODO.md).
 
-```rust
-loop {
-    let inspect = docker.inspect_container(service_name, None).await.unwrap();
-    if let Some(state) = inspect.state {
-        if state.running.unwrap_or(false) { break; }
-    }
-    sleep(Duration::from_secs(1)).await;
-}
-```
+### Resolved since this was written
 
-A job that finishes in under a second is never observed running, so the loop spins
-forever, the service never signals the `Barrier`, and *"All Docker definitions are
-up"* is never reached. `init-clickhouse` and the migrator would both hit this.
-`kanidm.yaml`'s `init-volume` (a `chown` that returns immediately) is exposed to it
-today.
+Three blockers this document originally recorded have since been fixed:
 
-`boot_service` needs to treat a container that has exited — ideally with status 0 —
-as booted, not keep waiting.
+- **`depends_on` is honored.** Both the list form and the long form with
+  `condition: service_started | service_healthy |
+  service_completed_successfully` parse into `DependsOn` /
+  `DependencyCondition`, and services boot in dependency order.
+  `validate_dependency_graph` rejects unknown dependencies and cycles up front
+  rather than deadlocking. (`acfab00`)
+- **One-shot containers no longer stall the barrier.** The readiness loop in
+  `boot_service` treats a terminal state (`EXITED` / `DEAD`) as launched, so a
+  job that finishes in under a second is not waited on forever (`acfab00`); the
+  loop is also capped and returns `DockerModuleError::ServiceStartTimeout`
+  instead of spinning (`d510d60`). `init-clickhouse` and the migrator are
+  expressible on this point.
+- **`restart` is honored.** The old hardcoded 5s crash-restart loop is gone;
+  `resolve_restart_policy` maps the compose key onto a Docker `RestartPolicy`
+  applied via `HostConfig`, so retry behaviour is the daemon's job and no longer
+  masks a genuine ordering failure with a burst of restarts. (`57b8094`)
 
 ### Smaller sharp edges
 
 - **`command` must be a scalar string.** A YAML sequence fails deserialization of
   the *entire file*, aborting startup. The deleted `logs_signoz.yaml` used
   `command: [ "-config.file=/etc/tempo.yaml" ]` and would not parse today.
-- **`ports` with a host-IP prefix are silently dropped.** Only `parts.len() == 2`
-  is handled ([docker.rs:643](../crates/core/src/docker.rs#L643)); every binding
-  is forced to `0.0.0.0` and `/tcp`. `haproxy.yaml`'s `"127.0.0.1:5432:5432"` is
-  already being discarded. If any SigNoz port should be loopback-only, this
-  parser cannot express it.
-- **`restart`, `healthcheck`, `labels`, `ulimits`, `tty` are all ignored.**
-  Upstream sets `ulimits: nofile: 262144` on ClickHouse; that must be arranged at
-  the daemon level instead.
+- **`ports` are always `/tcp`.** `host:container` and `ip:host:container` both
+  parse now, so a loopback-only binding like `haproxy.yaml`'s
+  `"127.0.0.1:5432:5432"` is honored. But the protocol is hardcoded — a `/udp`
+  suffix, a container-only port, and port ranges are all still unsupported.
+- **`healthcheck`, `labels`, `ulimits`, `tty` are all ignored.** Upstream sets
+  `ulimits: nofile: 262144` on ClickHouse; that must be arranged at the daemon
+  level instead.
 
 ---
 
@@ -339,9 +352,9 @@ Recommended order:
 
 1. **Add `entrypoint: Option<String>`** to `ServiceConfig` and wire it to
    `ContainerCreateBody.entrypoint`. Without it the migrator is not expressible.
-2. **Fix one-shot handling in `boot_service`** — treat an exited container as
-   booted instead of polling `running == true` forever. This also unbreaks
-   `kanidm.yaml`'s `init-volume`.
+2. **Parse `healthcheck`** and pass it to `bollard`, so the
+   `condition: service_healthy` gates SigNoz's ordering contract depends on
+   actually wait for readiness rather than for "running".
 3. Then vendor the ClickHouse configs under `containers/config/signoz/`, write
    `containers/signoz.yaml` with `signoz-`-prefixed keys, add the `signoz_out`
    sink to `config/vector.yaml`, add the HAProxy ACL entry, and record the new
@@ -349,7 +362,9 @@ Recommended order:
 4. Remove the `# signoz:` placeholder from `observability_ui.yaml`.
 
 Steps 1 and 2 are independently useful — they fix latent problems that exist
-regardless of whether SigNoz is ever adopted.
+regardless of whether SigNoz is ever adopted. The two other prerequisites this
+document originally listed (one-shot handling and `depends_on`) have since
+landed; see §4.
 
 ### Unrelated, but found while surveying
 

@@ -29,6 +29,7 @@ Keep it under 72 characters.
 - `cargo build --workspace` must succeed before marking the PR ready for review
 - `cargo nextest run --workspace` must pass (or `cargo test --workspace`)
 - Link to the relevant section in CLAUDE.md or a `.claude/` rule file if the PR establishes a new pattern
+- `TODO.md` and any `docs/` page the PR makes stale are updated in the same PR (`.claude/doc-upkeep.md`)
 
 ## Size guidance
 

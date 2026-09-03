@@ -73,6 +73,7 @@ cargo install --locked cargo-nextest cargo-watch cargo-deny cargo-audit
 
 Use your file-reading capabilities to read the exact rules in the `.claude/` directory **before** executing any of the following tasks:
 
+- **Starting a session, committing, or closing a milestone:** Read `.claude/doc-upkeep.md`
 - **Committing code:** Read `.claude/commit-conventions.md`
 - **Creating branches:** Read `.claude/branch-naming.md`
 - **Reviewing PRs:** Read `.claude/code-review.md`
