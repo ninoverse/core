@@ -15,6 +15,6 @@ services:
       - "9092:9092"
     volumes:
       - ./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - /home/nino/ninoverse/certs/nicolapasqualini.it.pem:/etc/haproxy/certs/nicolapasqualini.it.pem:ro
+      - /home/nino/ninoverse/certs/nicolapasqualini.it.pem:/etc/haproxy/certs/site.pem:ro
     networks:
       - ninoverse-network
