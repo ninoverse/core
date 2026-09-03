@@ -1,0 +1,148 @@
+# Redpanda node configuration.
+#
+# A Kafka client bootstraps against one address, is handed the broker's
+# *advertised* address in the metadata response, and reconnects to that. So each
+# vantage point needs its own listener whose advertised address is correct from
+# where that client stands -- hence three, not one.
+#
+#   internal  containers on ninoverse-network   -> kafka:9092
+#   host      the core app, over loopback       -> localhost:19092
+#   external  the internet, via haproxy         -> kafka.nicolapasqualini.it:9092
+#
+# Only "external" leaves the machine, so only it carries TLS. The other two are
+# a docker bridge and loopback; SCRAM never puts the password on the wire, and
+# terminating TLS there would only couple them to the 90-day cert rotation.
+
+redpanda:
+  data_directory: /var/lib/redpanda/data
+
+  # Skips the memory and xfs startup checks that a single container node cannot
+  # satisfy. Already the default in this image; stated here because this file
+  # replaces the stock one wholesale.
+  developer_mode: true
+
+  # Single node: it forms a cluster with itself and has no peers to contact.
+  empty_seed_starts_cluster: true
+  seed_servers: []
+
+  # Raft and inter-broker traffic. Bound but idle with one node, and never
+  # published beyond the compose network.
+  rpc_server:
+    address: 0.0.0.0
+    port: 33145
+
+  # Must be a routable name, not 0.0.0.0: redpanda validates that an advertised
+  # address is not ADDR_ANY and refuses to start otherwise. Single node, so this
+  # only ever talks to itself.
+  advertised_rpc_api:
+    address: kafka
+    port: 33145
+
+  # Admin API and Prometheus metrics. Must listen on 0.0.0.0, not loopback:
+  # haproxy health-checks /v1/status/ready on this port from another container.
+  admin:
+    address: 0.0.0.0
+    port: 9644
+
+  kafka_api:
+    - name: internal
+      address: 0.0.0.0
+      port: 9092
+      authentication_method: sasl
+    - name: host
+      address: 0.0.0.0
+      port: 19092
+      authentication_method: sasl
+    - name: external
+      address: 0.0.0.0
+      port: 29092
+      authentication_method: sasl
+
+  advertised_kafka_api:
+    - name: internal
+      address: kafka
+      port: 9092
+    - name: host
+      address: localhost
+      port: 19092
+    - name: external
+      # The port haproxy publishes to the world, not the container port behind
+      # it -- this is the address the client is told to dial back on.
+      address: kafka.nicolapasqualini.it
+      port: 9092
+
+  kafka_api_tls:
+    - name: external
+      enabled: true
+      # The same Let's Encrypt pair kanidm reads, copied out of
+      # /home/nino/ninoverse/certs by init-redpanda-config. Copied rather than
+      # mounted because key.pem is mode 600 owned by uid 8443, while redpanda
+      # runs as uid 101 and cannot be given both identities.
+      cert_file: /etc/redpanda/certs/chain.pem
+      key_file: /etc/redpanda/certs/key.pem
+      require_client_auth: false
+
+# REST produce/consume for constrained devices. Reached only through APISIX,
+# never published directly -- APISIX supplies the identity boundary here, the
+# same arrangement nora already uses in registry.yaml.
+pandaproxy:
+  pandaproxy_api:
+    - address: 0.0.0.0
+      port: 8082
+
+schema_registry:
+  schema_registry_api:
+    - address: 0.0.0.0
+      port: 8081
+
+# Both of these are Kafka clients living inside the broker process, and once
+# enable_sasl is on they must authenticate like any other client. Without them
+# every REST call returns 503 broker_not_available, because their seed broker
+# defaults to 0.0.0.0:9092 with no credentials.
+#
+# __RP_ADMIN_PASSWORD__ is substituted by init-redpanda-config at container
+# start from RP_ADMIN_PASSWORD, so no credential is committed to the repo.
+pandaproxy_client:
+  brokers:
+    - address: localhost
+      port: 9092
+  sasl_mechanism: SCRAM-SHA-512
+  scram_username: admin
+  scram_password: __RP_ADMIN_PASSWORD__
+
+schema_registry_client:
+  brokers:
+    - address: localhost
+      port: 9092
+  sasl_mechanism: SCRAM-SHA-512
+  scram_username: admin
+  scram_password: __RP_ADMIN_PASSWORD__
+
+rpk:
+  # These are the runtime half of `--mode dev-container`. That flag is not used
+  # on the command line because rpk implements it by rewriting this file, which
+  # fails on a read-only mount; its cluster-property half lives in
+  # redpanda-bootstrap.yaml instead.
+  #
+  # `--unsafe-bypass-fsync` is deliberately NOT among them. dev-container mode
+  # sets it, and it trades durability for speed -- an unclean shutdown can
+  # corrupt the log. The old apache/kafka broker fsynced normally and this now
+  # carries data from devices that cannot simply replay it.
+  # --reserve-memory and --overprovisioned are not listed: rpk derives both from
+  # developer_mode and rejects the config outright if they also appear here.
+  additional_start_flags:
+    - --smp=1
+
+  # No host tuning: this is a container on a shared machine.
+  tune_network: false
+  tune_disk_scheduler: false
+  tune_disk_nomerges: false
+  tune_disk_irq: false
+  tune_fstrim: false
+  tune_cpu: false
+  tune_aio_events: false
+  tune_clocksource: false
+  tune_swappiness: false
+  enable_memory_locking: false
+  tune_coredump: false
+  coredump_dir: "/var/lib/redpanda/coredump"

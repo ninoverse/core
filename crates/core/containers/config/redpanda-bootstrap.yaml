@@ -1,0 +1,47 @@
+# Cluster properties, seeded on the first start of an empty data volume.
+#
+# Unlike redpanda.yaml (node-local, read every boot) these live in the
+# controller log once written. Editing this file against an existing volume
+# changes nothing -- use `rpk cluster config set <name> <value>` instead.
+
+# Authentication on every listener, and ACLs enforced once a principal is known.
+enable_sasl: true
+kafka_enable_authorization: true
+# "SCRAM", not "SCRAM-SHA-512": this list takes mechanism *families*, and
+# SCRAM covers both SHA-256 and SHA-512. Redpanda accepts an unknown string here
+# silently -- it just enables nothing, and every client is then rejected with
+# UNSUPPORTED_SASL_MECHANISM. (The per-user mechanism in RP_BOOTSTRAP_USER is a
+# different field and does spell out SCRAM-SHA-512.)
+sasl_mechanisms:
+  - SCRAM
+  - OAUTHBEARER
+
+# Created from RP_BOOTSTRAP_USER on first boot; bypasses ACL checks.
+superusers:
+  - admin
+
+# Mobile and browser clients present kanidm tokens instead of a password. The
+# discovery URL is what `init_kanidm_apisix` generates for client_id "kafka" --
+# the two must stay in step.
+oidc_discovery_url: https://auth.nicolapasqualini.it/oauth2/openid/kafka/.well-known/openid-configuration
+oidc_token_audience: kafka
+oidc_principal_mapping: $.preferred_username
+
+# Carried over from the KAFKA_NUM_PARTITIONS / replication-factor / rebalance
+# settings the apache/kafka broker used.
+default_topic_partitions: 3
+default_topic_replications: 1
+group_initial_rebalance_delay: 0
+
+# The cluster-property half of `--mode dev-container`, which cannot be passed as
+# a flag here -- rpk implements that flag by rewriting the read-only node config.
+# Matches the auto-create behaviour the apache/kafka broker had by default, sizes
+# the consumer-offsets topic for a single node, and drops the 5GiB free-space
+# floor that a homelab disk should not have to reserve.
+auto_create_topics_enabled: true
+group_topic_partitions: 3
+storage_min_free_bytes: 10485760
+
+# dev-container mode also sets write_caching_default and unsafe fsync bypass.
+# Both are left at their safe defaults: this broker now carries data from
+# devices that cannot replay it, so acknowledged writes must be durable.

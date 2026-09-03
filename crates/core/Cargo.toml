@@ -23,7 +23,11 @@ sqlx = { version = "0.8.6", features = [
     "postgres",
     "migrate",
 ] }
-rdkafka = { version = "0.39", features = ["cmake-build"] }
+rdkafka = { version = "0.39", features = [
+    "cmake-build",
+    "sasl",
+    "ssl-vendored",
+] }
 futures = "0.3.32"
 actix-web = "4.14.0"
 thiserror = "2.0.18"

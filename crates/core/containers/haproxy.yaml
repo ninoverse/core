@@ -8,10 +8,13 @@ services:
       - "443:443"
       - "4317:4317"
       - "4318:4318"
-      # For now the ports can't define an host, it can be only port:port
-      # - "127.0.0.1:5432:5432"
-      # - "127.0.0.1:9092:9092"
-      - "5432:5432"
+      # Postgres is cleartext and unauthenticated at the proxy, so it is bound
+      # to loopback and never offered to the LAN. docker.rs:954 accepts the
+      # host:port:port form, so this no longer has to be published on 0.0.0.0.
+      - "127.0.0.1:5432:5432"
+      # Kafka stays on 0.0.0.0 deliberately: redpanda terminates TLS and
+      # requires SASL on this listener, and IoT/mobile clients reach it from
+      # outside. See the kafka_in frontend in config/haproxy.cfg.
       - "9092:9092"
     volumes:
       - ./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro

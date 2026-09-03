@@ -81,12 +81,35 @@ impl fmt::Debug for PostgresDatabaseConfiguration {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct KafkaBrokerConfiguration {
     pub broker: String,
     #[serde(deserialize_with = "deserialize_kafka_topics")]
     pub topics: Vec<KafkaTopic>,
     pub group_id: String,
+    /// `plaintext` on the loopback listener, `sasl_ssl` when reaching the
+    /// broker over TLS from outside the host.
+    pub security_protocol: String,
+    pub sasl_mechanism: String,
+    pub sasl_username: String,
+    pub sasl_password: String,
+}
+
+// Hand-written so the password cannot reach a log through a derived Debug,
+// matching PostgresDatabaseConfiguration above.
+impl fmt::Debug for KafkaBrokerConfiguration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KafkaBrokerConfiguration")
+            .field("broker", &self.broker)
+            .field("topics", &self.topics)
+            .field("group_id", &self.group_id)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &"***")
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]

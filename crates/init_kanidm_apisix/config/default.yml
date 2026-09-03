@@ -90,6 +90,27 @@ services:
     group: "headlamp_admins"
     mode: "native"
     native_redirect_url: "https://headlamp.nicolapasqualini.it/oidc-callback"
+  # The broker validates SASL/OAUTHBEARER tokens itself against this client's
+  # discovery document, so apisix is not in the Kafka TCP path -- which is what
+  # `native` means here. The discovery URL this generates must match
+  # oidc_discovery_url in containers/config/redpanda-bootstrap.yaml.
+  # native_redirect_url belongs to whichever mobile client runs the flow;
+  # replace the placeholder when that app exists.
+  - client_id: "kafka"
+    display_name: "Redpanda Broker"
+    subdomain: "kafka"
+    group: "kafka_clients"
+    mode: "native"
+    native_redirect_url: "https://kafka.nicolapasqualini.it/oidc-callback"
+  # Devices that cannot speak the Kafka protocol produce and consume over
+  # HTTPS instead. `api` validates a bearer token with no browser flow, and
+  # pandaproxy is never published directly -- apisix is its identity boundary.
+  - client_id: "kafka-rest"
+    display_name: "Redpanda HTTP Proxy"
+    subdomain: "kafka"
+    upstream: "kafka:8082"
+    group: "kafka_clients"
+    mode: "api"
 
 persons:
   - name: "nino"
@@ -105,3 +126,4 @@ persons:
       - "openobserve_users"
       - "registry_users"
       - "headlamp_admins"
+      - "kafka_clients"

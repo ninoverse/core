@@ -79,14 +79,25 @@ fn log_delivery_outcome(outcome: Result<OwnedDeliveryResult, Canceled>) {
     }
 }
 
+fn base_client_config(app_configuration: &NinoverseCoreConfiguration) -> ClientConfig {
+    let mut client_configuration = ClientConfig::new();
+    client_configuration
+        .set("bootstrap.servers", &app_configuration.kafka.broker)
+        .set(
+            "security.protocol",
+            &app_configuration.kafka.security_protocol,
+        )
+        .set("sasl.mechanism", &app_configuration.kafka.sasl_mechanism)
+        .set("sasl.username", &app_configuration.kafka.sasl_username)
+        .set("sasl.password", &app_configuration.kafka.sasl_password);
+    client_configuration
+}
+
 async fn create_kafka_admin_client(
     app_configuration: &NinoverseCoreConfiguration,
 ) -> KafkaResult<AdminClient<KafkaBrokerContext>> {
     info!(["ADMIN_CLIENT_CREATION"], "Creating admin client.");
-    match ClientConfig::new()
-        .set("bootstrap.servers", &app_configuration.kafka.broker)
-        .create_with_context(KafkaBrokerContext {})
-    {
+    match base_client_config(app_configuration).create_with_context(KafkaBrokerContext {}) {
         Ok(admin_client) => {
             info!(
                 ["ADMIN_CLIENT_CREATION"],
@@ -265,9 +276,8 @@ async fn create_kafka_consumer(
     app_configuration: &NinoverseCoreConfiguration,
 ) -> KafkaResult<StreamConsumer> {
     info!(["CONSUMER_CREATION"], "Creating consumer.");
-    let consumer: StreamConsumer = ClientConfig::new()
+    let consumer: StreamConsumer = base_client_config(app_configuration)
         .set("group.id", &app_configuration.kafka.group_id)
-        .set("bootstrap.servers", &app_configuration.kafka.broker)
         .set("enable.partition.eof", "false")
         .set("session.timeout.ms", "6000")
         .set("enable.auto.commit", "true")
@@ -364,8 +374,7 @@ async fn create_kafka_producer(
     app_configuration: &NinoverseCoreConfiguration,
 ) -> KafkaResult<FutureProducer> {
     info!(["PRODUCER_CREATION"], "Creating producer.");
-    let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", &app_configuration.kafka.broker)
+    let producer: FutureProducer = base_client_config(app_configuration)
         .set("message.timeout.ms", "5000")
         .set("enable.idempotence", "true")
         .create()

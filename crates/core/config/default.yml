@@ -11,10 +11,20 @@ database:
   connection_attempt: 5
 
 kafka:
-  broker: "localhost:9092"
+  # The broker's loopback-only "host" listener. 9092 is the internet-facing
+  # one and is reachable only over TLS.
+  broker: "localhost:19092"
   group_id: "ninoverse"
   topics:
     - "ninoverse:1:1"
+  # Every listener requires SASL. Plaintext is safe here only because this
+  # address is bound to 127.0.0.1; use sasl_ssl for anything off-host.
+  # Override the password with APP__KAFKA__SASL_PASSWORD rather than editing it
+  # in: bin/init_redpanda.sh creates this user.
+  security_protocol: "sasl_plaintext"
+  sasl_mechanism: "SCRAM-SHA-512"
+  sasl_username: "core-app"
+  sasl_password: "changeme"
 
 docker:
   remove_containers_on_shutdown: true

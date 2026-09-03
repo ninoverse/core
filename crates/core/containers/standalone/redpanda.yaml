@@ -1,0 +1,76 @@
+name: redpanda
+
+services:
+  # rpk rewrites /etc/redpanda/redpanda.yaml on every start, by writing a
+  # temporary file beside it and renaming over the top. That cannot be done to a
+  # bind-mounted file, so the config is copied into a volume rather than mounted.
+  # The same copy solves the certificates: key.pem is mode 600 owned by uid 8443
+  # for kanidm, while redpanda runs as uid 101, and one file cannot be readable
+  # by both without loosening permissions certbot resets on every renewal.
+  init-redpanda-config:
+    image: busybox:1.38.0
+    container_name: init-redpanda-config
+    restart: "no"
+    # $$ so compose leaves the variable for the shell inside the container: the
+    # password reaches sed through the environment, never the command line,
+    # where `docker inspect` would expose it.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        cp /src/redpanda.yaml /conf/redpanda.yaml
+        cp /src/redpanda-bootstrap.yaml /conf/.bootstrap.yaml
+        sed -i "s|__RP_ADMIN_PASSWORD__|$$RP_ADMIN_PASSWORD|g" /conf/redpanda.yaml
+        mkdir -p /conf/certs
+        cp /certs-src/chain.pem /certs-src/key.pem /conf/certs/
+        chown -R 101:101 /conf /data
+        chmod 600 /conf/certs/key.pem
+    environment:
+      - RP_ADMIN_PASSWORD=${RP_ADMIN_PASSWORD:?set RP_ADMIN_PASSWORD before starting redpanda}
+    volumes:
+      - ../config/redpanda.yaml:/src/redpanda.yaml:ro
+      - ../config/redpanda-bootstrap.yaml:/src/redpanda-bootstrap.yaml:ro
+      - /home/nino/ninoverse/certs:/certs-src:ro
+      - redpanda-conf:/conf
+      - redpanda-data:/data
+
+  # Kafka-compatible broker. Keeps the service and container name "kafka" so
+  # haproxy's backend, the app's bootstrap address and every other existing
+  # reference stay exactly as they are.
+  #
+  # Three Kafka listeners, because a client is handed the *advertised* address
+  # and reconnects to it, so each vantage point needs one that is correct from
+  # where it stands: 9092 internal (kafka:9092), 19092 host (localhost:19092,
+  # published on loopback only), 29092 external (kafka.nicolapasqualini.it:9092,
+  # TLS, reached through haproxy). All three require SASL. Also 9644 admin,
+  # 8081 schema registry, 8082 HTTP proxy, 33145 internal raft -- none published.
+  kafka:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2
+    container_name: kafka
+    restart: unless-stopped
+    depends_on:
+      init-redpanda-config:
+        condition: service_completed_successfully
+    command:
+      - redpanda
+      - start
+    # Creates the superuser on an empty data volume. The same password the init
+    # container substitutes for the in-process proxy clients.
+    environment:
+      - RP_BOOTSTRAP_USER=admin:${RP_ADMIN_PASSWORD:?set RP_ADMIN_PASSWORD before starting redpanda}:SCRAM-SHA-512
+    ports:
+      - "127.0.0.1:19092:19092"
+    volumes:
+      - redpanda-conf:/etc/redpanda
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - ninoverse-network
+
+volumes:
+  redpanda-conf:
+  redpanda-data:
+
+networks:
+  ninoverse-network:
+    external: true

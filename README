@@ -2,9 +2,8 @@
 
 Rust orchestrator for the `ninoverse` home infrastructure: on startup it reads
 compose-style YAML definitions, stands up the required Docker networks,
-volumes and containers, and initializes a Postgres pool with migrations.
-Kafka and HTTP layers exist in the codebase but are not yet wired into the
-running binary (see [Status](#status)).
+volumes and containers, and initializes a Postgres pool with migrations, then
+starts the HTTP listener and the Kafka producer/consumer threads.
 
 ## What it does
 
@@ -20,12 +19,16 @@ running binary (see [Status](#status)).
 
 ## Status
 
-`src/main.rs` only wires up `configuration`, `docker`, `db_handler`,
-and `logger`. `kafka_handler` and `web_server` (actix-web) are implemented
-but their entry points (`init_kafka`, `init_request_handler`) are not yet
-called — the intended `run_threads` wiring is commented out. `http_handler`
-(a hand-rolled HTTP request/response parser) exists on disk but isn't
-declared as a module and isn't compiled in at all.
+`run_threads` starts both `init_request_handler` (actix-web) and `init_kafka`.
+Note that `init_kafka`'s error propagates out of startup: if the admin client
+cannot reach a broker the binary exits and removes the containers it started,
+which is why the broker has to be up first (see
+[Bootstrapping a fresh clone](#bootstrapping-a-fresh-clone)).
+`http_handler` (a hand-rolled HTTP request/response parser) exists on disk but
+isn't declared as a module and isn't compiled in at all.
+
+The `containers/` table below is out of date beyond the rows for the broker
+and postgres — several listed files no longer exist.
 
 ## Workspace layout
 
@@ -55,7 +58,8 @@ Cargo workspace, single member today:
 
 | File | Service(s) | Purpose |
 |------|-----------|---------|
-| `services.yaml` | `broker`, `postgres` | Kafka broker (KRaft, single node) and the app's Postgres instance. |
+| `core.yaml` | `postgres` | The app's Postgres instance. |
+| `standalone/redpanda.yaml` | `kafka` | Redpanda, the Kafka-compatible broker. **Not** started by the orchestrator — `command` as a list and `${VAR}` interpolation are both beyond `docker.rs`, so it runs from `bin/start_redpanda.sh` like k3s does. |
 | `networks.yaml` | `ninoverse-network` | Shared bridge network for every container. |
 | `volumes.yaml` | — | Named volumes for every stateful service below. |
 | `haproxy.yaml` | `haproxy` | TLS-terminating router in front of Postgres and the OTLP ingest ports. |
@@ -95,6 +99,34 @@ cargo run                    # loads config/default.yml relative to this dir
 `Ctrl+C` triggers a graceful shutdown: the broadcast channel fires, spawned
 container-supervisor tasks are joined, and (per config) started containers
 are removed.
+
+## Bootstrapping a fresh clone
+
+`cargo run` alone is not enough on a machine that has never run this before.
+Start the broker first — `init_kafka`'s error propagates out of startup, so
+`core` exits and removes every container it started when nothing answers:
+
+```bash
+RP_ADMIN_PASSWORD=... bin/start_redpanda.sh              # also creates ninoverse-network
+RP_ADMIN_PASSWORD=... CORE_APP_PASSWORD=... bin/init_redpanda.sh
+mkdir -p secrets && printf 'admin-secret-key-placeholder' > secrets/APISIX_ADMIN_KEY
+cd crates/core && APP__KAFKA__SASL_PASSWORD=... cargo run
+bin/init_kanidm.sh                                       # second terminal, interactive
+cargo run -p init_kanidm_apisix                          # from the repo ROOT
+```
+
+Three things live outside git and have to exist first: the certificates in
+`/home/nino/ninoverse/certs` (owned `8443:8443`), `secrets/APISIX_ADMIN_KEY`
+(which `init_kanidm_apisix` deliberately errors on rather than generating, and
+which must equal `ADMIN_KEY` in `containers/api_gateway.yaml`), and a kanidm
+admin session from `bin/init_kanidm.sh`.
+
+Working directory matters twice: `core` runs from `crates/core`,
+`init_kanidm_apisix` from the repository root — `secrets_dir` is CWD-relative.
+
+Per-component runbooks live in [`docs/`](docs/):
+[redpanda](docs/redpanda.md), [headlamp](docs/headlamp.md),
+[signoz](docs/signoz.md).
 
 ## Daily commands
 
