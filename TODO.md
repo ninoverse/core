@@ -132,9 +132,9 @@ The minimum needed to boot most real compose files correctly. Entries marked
 - **`ports` long syntax.** `target` / `published` / `protocol` / `mode`
   mapping form.
 - **Top-level `name:` (project namespace).** Compose prefixes resources with a
-  project name. The `format!("{}", raw_name)` calls
-  (`docker.rs:409,412,430,437`) are no-ops — decide on and apply a real
-  naming/namespacing scheme.
+  project name. The `raw_name.to_string()` / `net.to_string()` calls
+  (`docker.rs:408,411,429,436`) copy the name through unchanged — decide on and
+  apply a real naming/namespacing scheme.
 
 ### Nice to have
 

@@ -12,7 +12,6 @@ use bollard::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
-use serde_yaml;
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -406,10 +405,10 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
 
                         if let Some(services) = compose_config.services {
                             for (raw_name, mut config) in services {
-                                let unique_name = format!("{}", raw_name);
+                                let unique_name = raw_name.to_string();
                                 if let Some(ref mut nets) = config.networks {
                                     for net in nets.iter_mut() {
-                                        *net = format!("{}", net);
+                                        *net = net.to_string();
                                     }
                                 }
                                 if let Some(volumes) = config.volumes.take() {
@@ -427,14 +426,14 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
 
                         if let Some(networks) = compose_config.networks {
                             for (raw_name, config) in networks {
-                                let unique_name = format!("{}", raw_name);
+                                let unique_name = raw_name.to_string();
                                 definitions.networks.push((unique_name, config));
                             }
                         }
 
                         if let Some(volumes) = compose_config.volumes {
                             for (raw_name, config) in volumes {
-                                let unique_name = format!("{}", raw_name);
+                                let unique_name = raw_name.to_string();
                                 definitions.volumes.push((unique_name, config));
                             }
                         }
@@ -501,10 +500,10 @@ pub async fn create_docker_volumes(
     docker: &Docker,
 ) -> Result<(), DockerModuleError> {
     for docker_volume in docker_volumes {
-        let volume_name = Some(docker_volume.0);
+        let volume_name = docker_volume.0;
 
         let volume_config = VolumeCreateRequest {
-            name: volume_name.clone(),
+            name: Some(volume_name.clone()),
             driver: docker_volume.1.unwrap_or_default().driver,
             ..Default::default()
         };
@@ -512,17 +511,16 @@ pub async fn create_docker_volumes(
         match docker.create_volume(volume_config).await {
             Ok(_) => info!(
                 ["DOCKER_INIT"],
-                "Volume [{}] created successfully.",
-                &volume_name.unwrap_or(String::from("unnamed volume"))
+                "Volume [{}] created successfully.", &volume_name
             ),
             Err(bollard::errors::Error::DockerResponseServerError {
-                status_code,
+                status_code: 409,
                 message,
-            }) if status_code == 409 => {
+            }) => {
                 warn!(
                     ["DOCKER_INIT"],
                     "Warning: Volume [{}] exists but has a config conflict: {}, proceeding anyway...",
-                    &volume_name.unwrap_or(String::from("unnamed volume")),
+                    &volume_name,
                     message
                 );
             }
@@ -1056,9 +1054,9 @@ async fn boot_service(
             ["DOCKER_INIT"],
             "Container [{}] created successfully.", &service_name
         ),
-        Err(bollard::errors::Error::DockerResponseServerError { status_code, .. })
-            if status_code == 409 =>
-        {
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409, ..
+        }) => {
             warn!(
                 ["DOCKER_INIT"],
                 "Warning: Container [{}] exists, proceeding anyway...", &service_name
@@ -1115,9 +1113,9 @@ async fn boot_service(
                 ));
             }
         }
-        Err(bollard::errors::Error::DockerResponseServerError { status_code, .. })
-            if status_code == 409 =>
-        {
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409, ..
+        }) => {
             warn!(
                 ["DOCKER_INIT"],
                 "Warning: Container [{}] exists, proceeding anyway...", &service_name
