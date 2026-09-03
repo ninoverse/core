@@ -27,6 +27,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace
 ```
 
+…and `TODO.md` plus every affected `docs/` page have been reconciled against the
+code the group actually landed (`.claude/doc-upkeep.md`).
+
 ---
 
 ## Within each group

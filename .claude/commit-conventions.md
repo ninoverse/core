@@ -44,8 +44,14 @@ docs: document MSRV policy in CLAUDE.md
 feat!: bump MSRV to 1.85
 ```
 
+## Before every commit
+
+Check whether the change makes anything in `TODO.md` or `docs/` false. If it
+does, fix it in the same commit. See `.claude/doc-upkeep.md`.
+
 ## What to avoid
 
 - Vague messages: `fix stuff`, `update`, `wip`
 - Mixing unrelated changes in one commit
 - Committing secrets or credentials (they are gitignored for a reason)
+- Leaving a doc describing behaviour the commit just changed
