@@ -57,6 +57,8 @@ pub struct ServiceConfig {
     pub restart: Option<String>,
     #[serde(skip)]
     pub restart_policy: Option<RestartPolicy>,
+    #[serde(skip)]
+    pub command_argv: Option<Vec<String>>,
 }
 
 impl ServiceConfig {
@@ -160,6 +162,11 @@ pub enum DockerModuleError {
     #[error("Invalid restart policy: {0}")]
     InvalidRestartPolicy(String),
 
+    /// A service's `command:` could not be split into arguments — an
+    /// unterminated quote or a trailing backslash.
+    #[error("Service [{service}] has a malformed command: {command}")]
+    InvalidCommand { service: String, command: String },
+
     #[error("Service [{service}] depends on unknown service [{dependency}]")]
     UnknownDependency { service: String, dependency: String },
 
@@ -211,6 +218,27 @@ fn resolve_restart_policy(restart: Option<&str>) -> Result<RestartPolicy, Docker
         name: Some(name),
         maximum_retry_count,
     })
+}
+
+/// Split the compose `command:` string into an argv vector. `shlex::split`
+/// returns `None` on an unterminated quote or trailing backslash; surfacing that
+/// as an error keeps a malformed command from silently falling back to the
+/// image's default command.
+fn resolve_command(
+    service_name: &str,
+    command: Option<&str>,
+) -> Result<Option<Vec<String>>, DockerModuleError> {
+    match command {
+        None => Ok(None),
+        Some(command) => {
+            shlex::split(command)
+                .map(Some)
+                .ok_or_else(|| DockerModuleError::InvalidCommand {
+                    service: service_name.to_string(),
+                    command: command.to_string(),
+                })
+        }
+    }
 }
 
 fn is_host_path(source: &str) -> bool {
@@ -420,6 +448,8 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                                 }
                                 config.restart_policy =
                                     Some(resolve_restart_policy(config.restart.as_deref())?);
+                                config.command_argv =
+                                    resolve_command(&unique_name, config.command.as_deref())?;
                                 definitions.services.push((unique_name, config));
                             }
                         }
@@ -977,8 +1007,6 @@ async fn boot_service(
 
     let _container_name = service_config.container_name.unwrap_or_default();
 
-    let command = shlex::split(&service_config.command.unwrap_or_default()).unwrap_or_default();
-
     let user = service_config.user.unwrap_or_default();
 
     let container_configuration = ContainerCreateBody {
@@ -988,7 +1016,7 @@ async fn boot_service(
             endpoints_config: Some(network_endpoints),
         }),
         env: Some(environment),
-        cmd: Some(command),
+        cmd: service_config.command_argv,
         user: Some(user),
         ..Default::default()
     };
@@ -1298,5 +1326,43 @@ mod tests {
                 input
             );
         }
+    }
+
+    #[test]
+    fn command_absent_yields_none() {
+        assert_eq!(resolve_command("app", None).expect("no command"), None);
+    }
+
+    #[test]
+    fn command_splits_shell_string_into_argv() {
+        let argv = resolve_command("app", Some(r#"sh -c "echo hi""#)).expect("valid command");
+        assert_eq!(argv, Some(vec!["sh".into(), "-c".into(), "echo hi".into()]));
+    }
+
+    #[test]
+    fn empty_command_yields_empty_argv() {
+        // An explicit `command: ""` is a valid parse, not a malformed one, and
+        // must stay distinguishable from the rejected cases below.
+        assert_eq!(
+            resolve_command("app", Some("")).expect("valid command"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn command_rejects_unterminated_quote() {
+        // Without this the container silently runs the image's default command.
+        assert!(matches!(
+            resolve_command("init", Some(r#"sh -c "chown -R 8443:8443 /data"#)),
+            Err(DockerModuleError::InvalidCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn command_rejects_trailing_backslash() {
+        assert!(matches!(
+            resolve_command("app", Some(r"echo hi \")),
+            Err(DockerModuleError::InvalidCommand { .. })
+        ));
     }
 }
