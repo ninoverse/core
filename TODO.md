@@ -113,8 +113,13 @@ The minimum needed to boot most real compose files correctly. Entries marked
   strings rather than failing the parse, a bare `KEY` (list) or null `KEY:`
   (map) inherits from the host and is dropped when unset, and a duplicated key
   collapses to its last occurrence, matching what Docker does with `Env`.
-- **`env_file`.** Load one or many env files (string / list) relative to the
-  compose dir and merge under `environment`.
+- [x] **`env_file`.** Was: not parsed at all, so a service keeping its variables
+  in a separate file silently got none of them. Now both the string and list
+  forms load via `resolve_environment`, resolved against the compose dir by
+  `resolve_host_path`, and merge under `environment` with Compose precedence —
+  files in the order listed, then inline `environment` on top. Line parsing
+  lives in `parse_env_file_content`; `export KEY=…` prefixes, multi-line values,
+  and interpolation inside env files are not supported.
 - **Variable interpolation `${VAR}` / `${VAR:-default}`.** Compose interpolates
   host env + `.env` into the file before parsing. None of this exists today;
   many real files depend on it.

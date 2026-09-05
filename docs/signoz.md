@@ -216,9 +216,9 @@ Symbols named in this section live in
 [docker.rs](../crates/core/src/docker.rs); they are given as names rather than
 line numbers so the references survive edits.
 
-`ServiceConfig` parses exactly ten compose keys: `image`, `ports`, `networks`,
-`volumes`, `environment`, `container_name`, `command`, `user`, `depends_on`,
-`restart` (plus four `#[serde(skip)]` fields the loader fills in itself —
+`ServiceConfig` parses exactly eleven compose keys: `image`, `ports`, `networks`,
+`volumes`, `environment`, `env_file`, `container_name`, `command`, `user`,
+`depends_on`, `restart` (plus four `#[serde(skip)]` fields the loader fills in —
 `mounts`, `env`, `restart_policy`, `command_argv`). No struct uses
 `deny_unknown_fields`, so everything else is **silently dropped** — the failure is
 invisible, not loud.

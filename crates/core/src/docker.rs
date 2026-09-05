@@ -51,6 +51,7 @@ pub struct ServiceConfig {
     #[serde(skip)]
     pub mounts: Vec<ResolvedMount>,
     pub environment: Option<Environment>,
+    pub env_file: Option<EnvFile>,
     #[serde(skip)]
     pub env: Vec<String>,
     pub container_name: Option<String>,
@@ -131,6 +132,15 @@ pub enum Environment {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+pub enum EnvFile {
+    /// `env_file: ./db.env`
+    Single(String),
+    /// `env_file: [./db.env, ./shared.env]`
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
 pub struct LongVolumeSpec {
     #[serde(rename = "type")]
     pub mount_type: String,
@@ -182,8 +192,8 @@ pub enum DockerModuleError {
     #[error("Service [{service}] has a malformed command: {command}")]
     InvalidCommand { service: String, command: String },
 
-    /// A service's `environment` could not be resolved — a non-scalar mapping
-    /// value, or (once `env_file` lands) an unreadable or malformed env file.
+    /// A service's environment could not be resolved — a non-scalar mapping
+    /// value, or an unreadable or malformed `env_file`.
     #[error("Service [{service}] has an invalid environment: {detail}")]
     InvalidEnvironment { service: String, detail: String },
 
@@ -261,21 +271,79 @@ fn resolve_command(
     }
 }
 
-/// Merge a service's `environment` into the `KEY=VALUE` list Docker expects.
-/// Both the list form (`- KEY=VALUE`, `- KEY`) and the mapping form
-/// (`KEY: value`, `KEY:`) are accepted. A key given without a value inherits
-/// from `variables` and is dropped when unset, matching Compose — a bare key
-/// asks for a value to be passed through if present, unlike `${VAR}`, which
-/// declares it required.
+/// Parse the `KEY=VALUE` lines of an env file. The caller owns the file read, so
+/// this stays a pure function over the content. Blank lines and `#` comments are
+/// skipped; the split is on the first `=` so a value may itself contain one; one
+/// layer of matching surrounding quotes is stripped. `export KEY=…` prefixes,
+/// multi-line values, and interpolation inside env files are not supported.
+fn parse_env_file_content(content: &str) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("line [{}] is not KEY=VALUE", line))?;
+
+        let value = value.trim();
+        let unquoted = match value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            Some(unquoted) => unquoted,
+            None => value
+                .strip_prefix('\'')
+                .and_then(|v| v.strip_suffix('\''))
+                .unwrap_or(value),
+        };
+
+        entries.push((key.trim().to_string(), unquoted.to_string()));
+    }
+
+    Ok(entries)
+}
+
+/// Merge a service's `env_file` and `environment` into the `KEY=VALUE` list
+/// Docker expects. Both the list form (`- KEY=VALUE`, `- KEY`) and the mapping
+/// form (`KEY: value`, `KEY:`) are accepted. A key given without a value
+/// inherits from `variables` and is dropped when unset, matching Compose — a
+/// bare key asks for a value to be passed through if present, unlike `${VAR}`,
+/// which declares it required. Compose precedence: env files in the order
+/// listed, then inline `environment` on top.
 fn resolve_environment(
     service_name: &str,
     environment: Option<Environment>,
+    env_file: Option<EnvFile>,
     variables: &BTreeMap<String, String>,
+    compose_dir: &Path,
 ) -> Result<Vec<String>, DockerModuleError> {
     // A map rather than a Vec: Docker resolves a duplicated key to the last
     // occurrence, so collapsing them here keeps what the container sees and
     // what the compose file says in agreement.
     let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+
+    let env_files = match env_file {
+        None => Vec::new(),
+        Some(EnvFile::Single(path)) => vec![path],
+        Some(EnvFile::Many(paths)) => paths,
+    };
+
+    for entry in env_files {
+        let path = resolve_host_path(&entry, compose_dir)?;
+        let content =
+            fs::read_to_string(&path).map_err(|source| DockerModuleError::InvalidEnvironment {
+                service: service_name.to_string(),
+                detail: format!("cannot read env_file [{}]: {}", path.display(), source),
+            })?;
+        let parsed = parse_env_file_content(&content).map_err(|detail| {
+            DockerModuleError::InvalidEnvironment {
+                service: service_name.to_string(),
+                detail: format!("env_file [{}]: {}", path.display(), detail),
+            }
+        })?;
+        resolved.extend(parsed);
+    }
 
     match environment {
         None => {}
@@ -541,7 +609,9 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                                 config.env = resolve_environment(
                                     &unique_name,
                                     config.environment.take(),
+                                    config.env_file.take(),
                                     &variables,
+                                    compose_dir,
                                 )?;
                                 definitions.services.push((unique_name, config));
                             }
@@ -1276,9 +1346,39 @@ mod tests {
             .collect()
     }
 
+    /// Resolve a service whose `env_file` entries point at real files, written
+    /// into a temporary directory named after `label` and removed afterwards.
+    /// Env-file paths in `yaml` are relative to that directory.
+    fn env_with_files(label: &str, yaml: &str, files: &[(&str, &str)]) -> Vec<String> {
+        let dir = env::temp_dir().join(format!("core-docker-{}-{}", std::process::id(), label));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for (name, content) in files {
+            fs::write(dir.join(name), content).expect("write env file");
+        }
+
+        let service = service_from_yaml(yaml);
+        let resolved = resolve_environment(
+            "app",
+            service.environment,
+            service.env_file,
+            &variables(&[]),
+            &dir,
+        );
+
+        fs::remove_dir_all(&dir).expect("clean up temp dir");
+        resolved.expect("valid environment")
+    }
+
     fn env_of(yaml: &str, variables: &BTreeMap<String, String>) -> Vec<String> {
         let service = service_from_yaml(yaml);
-        resolve_environment("app", service.environment, variables).expect("valid environment")
+        resolve_environment(
+            "app",
+            service.environment,
+            service.env_file,
+            variables,
+            Path::new("/containers"),
+        )
+        .expect("valid environment")
     }
 
     #[test]
@@ -1575,11 +1675,130 @@ mod tests {
     }
 
     #[test]
+    fn env_file_content_skips_comments_and_blank_lines() {
+        let entries = parse_env_file_content(
+            "# a comment\n\nPOSTGRES_USER=nino\n   \n  # indented comment\nDEBUG=true\n",
+        )
+        .expect("valid env file");
+        assert_eq!(
+            entries,
+            vec![
+                ("POSTGRES_USER".to_string(), "nino".to_string()),
+                ("DEBUG".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_content_splits_on_the_first_equals() {
+        // A connection string carries its own `=`; splitting on the last one
+        // (or on every one) would truncate it.
+        let entries = parse_env_file_content("DSN=host=db user=nino\n").expect("valid env file");
+        assert_eq!(
+            entries,
+            vec![("DSN".to_string(), "host=db user=nino".to_string())]
+        );
+    }
+
+    #[test]
+    fn env_file_content_strips_matching_quotes() {
+        let entries =
+            parse_env_file_content("DOUBLE=\"a b\"\nSINGLE='c d'\nBARE=e f\n").expect("valid");
+        assert_eq!(
+            entries,
+            vec![
+                ("DOUBLE".to_string(), "a b".to_string()),
+                ("SINGLE".to_string(), "c d".to_string()),
+                ("BARE".to_string(), "e f".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_content_keeps_unbalanced_quote_verbatim() {
+        // Only a matching pair is a quoting construct; a lone quote is part of
+        // the value.
+        let entries = parse_env_file_content("ODD=\"unclosed\n").expect("valid env file");
+        assert_eq!(entries, vec![("ODD".to_string(), "\"unclosed".to_string())]);
+    }
+
+    #[test]
+    fn env_file_content_rejects_line_without_equals() {
+        assert!(parse_env_file_content("POSTGRES_USER nino\n").is_err());
+    }
+
+    #[test]
+    fn environment_overrides_env_file() {
+        let env = env_with_files(
+            "override",
+            "image: busybox\nenv_file: db.env\nenvironment:\n  - LEVEL=debug\n",
+            &[("db.env", "LEVEL=info\nKEEP=yes\n")],
+        );
+        assert_eq!(env, vec!["KEEP=yes", "LEVEL=debug"]);
+    }
+
+    #[test]
+    fn later_env_file_overrides_earlier() {
+        let env = env_with_files(
+            "ordering",
+            "image: busybox\nenv_file:\n  - base.env\n  - local.env\n",
+            &[
+                ("base.env", "LEVEL=info\nKEEP=yes\n"),
+                ("local.env", "LEVEL=debug\n"),
+            ],
+        );
+        assert_eq!(env, vec!["KEEP=yes", "LEVEL=debug"]);
+    }
+
+    #[test]
+    fn env_file_missing_file_reports_the_path() {
+        let service = service_from_yaml("image: busybox\nenv_file: ./absent.env\n");
+        match resolve_environment(
+            "app",
+            service.environment,
+            service.env_file,
+            &variables(&[]),
+            Path::new("/nonexistent-compose-dir"),
+        ) {
+            Err(DockerModuleError::InvalidEnvironment { service, detail }) => {
+                assert_eq!(service, "app");
+                assert!(
+                    detail.contains("/nonexistent-compose-dir/absent.env"),
+                    "expected the resolved path in [{}]",
+                    detail
+                );
+            }
+            other => panic!("expected InvalidEnvironment, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn env_file_accepts_single_and_list_forms() {
+        // Both spellings must deserialize; the read itself is exercised by the
+        // missing-file case above.
+        assert!(matches!(
+            service_from_yaml("image: busybox\nenv_file: ./one.env\n").env_file,
+            Some(EnvFile::Single(_))
+        ));
+        assert!(matches!(
+            service_from_yaml("image: busybox\nenv_file:\n  - ./one.env\n  - ./two.env\n")
+                .env_file,
+            Some(EnvFile::Many(paths)) if paths.len() == 2
+        ));
+    }
+
+    #[test]
     fn environment_map_form_rejects_non_scalar_value() {
         let service =
             service_from_yaml("image: busybox\nenvironment:\n  NESTED:\n    - one\n    - two\n");
         assert!(matches!(
-            resolve_environment("app", service.environment, &variables(&[])),
+            resolve_environment(
+                "app",
+                service.environment,
+                service.env_file,
+                &variables(&[]),
+                Path::new("/containers"),
+            ),
             Err(DockerModuleError::InvalidEnvironment { .. })
         ));
     }
