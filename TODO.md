@@ -129,8 +129,10 @@ The minimum needed to boot most real compose files correctly. Entries marked
   misconfiguration for a loud one: an unset variable with no default is a
   `DockerModuleError::UnsetVariable` rather than Compose's warn-and-substitute-
   empty, and an unbraced `$VAR` is rejected rather than passed through.
-  `${VAR-default}` and `${VAR:?message}` are not implemented and are reported as
-  malformed rather than read as a variable name.
+  `${VAR:?message}` is supported and reports the author's own message
+  (`RequiredVariable`) — `containers/standalone/redpanda.yaml` already uses it.
+  `${VAR-default}` (no colon) is not implemented and is reported as malformed
+  rather than read as a variable name.
   The motivating case — the APISIX admin key — is **not yet closed end to end.**
   `init_kanidm_apisix` reads the key from `secrets/APISIX_ADMIN_KEY`
   (`SecretStore::apisix_admin_key` in `init_kanidm_apisix/src/secrets.rs`) to

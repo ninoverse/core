@@ -203,6 +203,15 @@ pub enum DockerModuleError {
     #[error("Compose file [{file}] references unset variable [{variable}]")]
     UnsetVariable { file: String, variable: String },
 
+    /// `${VAR:?message}` — the same requirement as `${VAR}`, but the compose
+    /// author supplied the message to fail with.
+    #[error("Compose file [{file}] is missing required variable [{variable}]: {message}")]
+    RequiredVariable {
+        file: String,
+        variable: String,
+        message: String,
+    },
+
     #[error("Compose file [{file}] has a malformed variable reference: {detail}")]
     InvalidVariableReference { file: String, detail: String },
 
@@ -339,14 +348,22 @@ fn load_interpolation_variables(compose_file_dir: &Path) -> BTreeMap<String, Str
     variables
 }
 
-/// Substitute `${VAR}` and `${VAR:-default}` into the compose text before it is
-/// parsed, the way Compose does. `$$` is a literal `$`.
+/// What to do when a `${VAR}` reference resolves to nothing.
+enum Fallback<'a> {
+    /// `${VAR:-default}` — substitute this instead.
+    Default(&'a str),
+    /// `${VAR}` (empty message) or `${VAR:?message}` — fail the load.
+    Required(&'a str),
+}
+
+/// Substitute `${VAR}`, `${VAR:-default}` and `${VAR:?message}` into the compose
+/// text before it is parsed, the way Compose does. `$$` is a literal `$`.
 ///
 /// Deliberately narrower than Compose in two places, both to trade a silent
 /// misconfiguration for a loud one: an unset variable with no default is an
 /// error rather than an empty string, and an unbraced `$VAR` is rejected rather
-/// than passed through untouched. `${VAR-default}` and `${VAR:?message}` are not
-/// supported and are reported as malformed rather than read as a variable name.
+/// than passed through untouched. `${VAR-default}` (no colon) is not supported
+/// and is reported as malformed rather than read as a variable name.
 fn interpolate_variables(
     file_label: &str,
     content: &str,
@@ -392,9 +409,12 @@ fn interpolate_variables(
         let reference = &tail[..end];
         rest = &tail[end + 1..];
 
-        let (name, default) = match reference.split_once(":-") {
-            Some((name, default)) => (name, Some(default)),
-            None => (reference, None),
+        let (name, fallback) = match reference.split_once(":-") {
+            Some((name, default)) => (name, Fallback::Default(default)),
+            None => match reference.split_once(":?") {
+                Some((name, message)) => (name, Fallback::Required(message)),
+                None => (reference, Fallback::Required("")),
+            },
         };
 
         if name.is_empty()
@@ -408,15 +428,22 @@ fn interpolate_variables(
             });
         }
 
-        let value = match (variables.get(name).map(String::as_str), default) {
+        let value = match (variables.get(name).map(String::as_str), fallback) {
             (Some(value), _) if !value.is_empty() => value,
             // `:-` falls back when the variable is unset *or* set to empty,
             // matching the shell and Compose.
-            (_, Some(default)) => default,
+            (_, Fallback::Default(default)) => default,
             // Set to empty with no default is the operator's explicit choice,
             // unlike an unset variable.
-            (Some(empty), None) => empty,
-            (None, None) => {
+            (Some(empty), Fallback::Required(_)) => empty,
+            (None, Fallback::Required(message)) if !message.is_empty() => {
+                return Err(DockerModuleError::RequiredVariable {
+                    file: file_label.to_string(),
+                    variable: name.to_string(),
+                    message: message.to_string(),
+                });
+            }
+            (None, Fallback::Required(_)) => {
                 return Err(DockerModuleError::UnsetVariable {
                     file: file_label.to_string(),
                     variable: name.to_string(),
@@ -2041,11 +2068,42 @@ mod tests {
     }
 
     #[test]
+    fn interpolate_reports_the_authors_message_for_a_required_variable() {
+        // `containers/standalone/redpanda.yaml` already uses this form.
+        match interpolate_variables(
+            "redpanda.yaml",
+            "      - RP_ADMIN_PASSWORD=${RP_ADMIN_PASSWORD:?set RP_ADMIN_PASSWORD first}\n",
+            &variables(&[]),
+        ) {
+            Err(DockerModuleError::RequiredVariable {
+                file,
+                variable,
+                message,
+            }) => {
+                assert_eq!(file, "redpanda.yaml");
+                assert_eq!(variable, "RP_ADMIN_PASSWORD");
+                assert_eq!(message, "set RP_ADMIN_PASSWORD first");
+            }
+            other => panic!("expected RequiredVariable, got ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn interpolate_substitutes_a_set_required_variable() {
+        let interpolated = interpolate_variables(
+            "redpanda.yaml",
+            "${RP_ADMIN_PASSWORD:?required}",
+            &variables(&[("RP_ADMIN_PASSWORD", "hunter2")]),
+        )
+        .expect("set variable");
+        assert_eq!(interpolated, "hunter2");
+    }
+
+    #[test]
     fn interpolate_rejects_unsupported_reference_forms() {
-        // `-` without the colon and `:?` are real Compose syntax that is not
-        // implemented; reading them as a variable name would silently produce
-        // the wrong value.
-        for reference in ["${VAR-default}", "${VAR:?required}", "${}", "${A B}"] {
+        // `-` without the colon is real Compose syntax that is not implemented;
+        // reading it as a variable name would silently produce the wrong value.
+        for reference in ["${VAR-default}", "${}", "${A B}"] {
             assert!(
                 matches!(
                     interpolate_variables("core.yaml", reference, &variables(&[])),
