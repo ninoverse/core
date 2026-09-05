@@ -197,6 +197,15 @@ pub enum DockerModuleError {
     #[error("Service [{service}] has an invalid environment: {detail}")]
     InvalidEnvironment { service: String, detail: String },
 
+    /// A compose file references a variable that is unset and carries no `:-`
+    /// default. Compose warns and substitutes empty here; that would boot a
+    /// service with an unset secret instead of failing the load.
+    #[error("Compose file [{file}] references unset variable [{variable}]")]
+    UnsetVariable { file: String, variable: String },
+
+    #[error("Compose file [{file}] has a malformed variable reference: {detail}")]
+    InvalidVariableReference { file: String, detail: String },
+
     #[error("Service [{service}] depends on unknown service [{dependency}]")]
     UnknownDependency { service: String, dependency: String },
 
@@ -302,6 +311,123 @@ fn parse_env_file_content(content: &str) -> Result<Vec<(String, String)>, String
     }
 
     Ok(entries)
+}
+
+/// Collect the variables available for interpolation: `.env` from the compose
+/// directory, with the host environment overlaid on top so the host wins —
+/// Compose's precedence. A missing `.env` is not an error.
+///
+/// A malformed `.env` is warned about and skipped rather than fatal: it is an
+/// operator-local convenience file, and any `${VAR}` that actually needed a
+/// value from it still fails loudly, with `UnsetVariable` naming the variable.
+fn load_interpolation_variables(compose_file_dir: &Path) -> BTreeMap<String, String> {
+    let mut variables = BTreeMap::new();
+
+    if let Ok(content) = fs::read_to_string(compose_file_dir.join(".env")) {
+        match parse_env_file_content(&content) {
+            Ok(entries) => variables.extend(entries),
+            Err(detail) => warn!(
+                ["DOCKER_INIT"],
+                "Ignoring malformed .env in [{}]: {}",
+                compose_file_dir.display(),
+                detail
+            ),
+        }
+    }
+
+    variables.extend(env::vars());
+    variables
+}
+
+/// Substitute `${VAR}` and `${VAR:-default}` into the compose text before it is
+/// parsed, the way Compose does. `$$` is a literal `$`.
+///
+/// Deliberately narrower than Compose in two places, both to trade a silent
+/// misconfiguration for a loud one: an unset variable with no default is an
+/// error rather than an empty string, and an unbraced `$VAR` is rejected rather
+/// than passed through untouched. `${VAR-default}` and `${VAR:?message}` are not
+/// supported and are reported as malformed rather than read as a variable name.
+fn interpolate_variables(
+    file_label: &str,
+    content: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<String, DockerModuleError> {
+    let mut interpolated = String::with_capacity(content.len());
+    let mut rest = content;
+
+    while let Some(index) = rest.find('$') {
+        interpolated.push_str(&rest[..index]);
+        let after = &rest[index + 1..];
+
+        if let Some(tail) = after.strip_prefix('$') {
+            interpolated.push('$');
+            rest = tail;
+            continue;
+        }
+
+        let Some(tail) = after.strip_prefix('{') else {
+            if after
+                .starts_with(|character: char| character.is_ascii_alphabetic() || character == '_')
+            {
+                let name: String = after
+                    .chars()
+                    .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                    .collect();
+                return Err(DockerModuleError::InvalidVariableReference {
+                    file: file_label.to_string(),
+                    detail: format!("[${name}] must be written [${{{name}}}]"),
+                });
+            }
+            interpolated.push('$');
+            rest = after;
+            continue;
+        };
+
+        let Some(end) = tail.find('}') else {
+            return Err(DockerModuleError::InvalidVariableReference {
+                file: file_label.to_string(),
+                detail: "unterminated [${]".to_string(),
+            });
+        };
+        let reference = &tail[..end];
+        rest = &tail[end + 1..];
+
+        let (name, default) = match reference.split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (reference, None),
+        };
+
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(DockerModuleError::InvalidVariableReference {
+                file: file_label.to_string(),
+                detail: format!("[${{{reference}}}] is not a variable name"),
+            });
+        }
+
+        let value = match (variables.get(name).map(String::as_str), default) {
+            (Some(value), _) if !value.is_empty() => value,
+            // `:-` falls back when the variable is unset *or* set to empty,
+            // matching the shell and Compose.
+            (_, Some(default)) => default,
+            // Set to empty with no default is the operator's explicit choice,
+            // unlike an unset variable.
+            (Some(empty), None) => empty,
+            (None, None) => {
+                return Err(DockerModuleError::UnsetVariable {
+                    file: file_label.to_string(),
+                    variable: name.to_string(),
+                });
+            }
+        };
+        interpolated.push_str(value);
+    }
+
+    interpolated.push_str(rest);
+    Ok(interpolated)
 }
 
 /// Merge a service's `env_file` and `environment` into the `KEY=VALUE` list
@@ -572,7 +698,7 @@ fn build_bollard_mount(resolved_mount: &ResolvedMount) -> Mount {
 pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModuleError> {
     let compose_file_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/containers"));
     let mut definitions = DockerDefinitions::default();
-    let variables: BTreeMap<String, String> = env::vars().collect();
+    let variables = load_interpolation_variables(compose_file_dir);
 
     if compose_file_dir.exists() && compose_file_dir.is_dir() {
         let compose_files = fs::read_dir(compose_file_dir)?;
@@ -584,6 +710,12 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                     if extension == "yml" || extension == "yaml" {
                         let yaml_content = fs::read_to_string(&path)?;
                         let compose_dir = path.parent().unwrap_or(compose_file_dir);
+                        let file_label = path.file_name().unwrap_or_default().to_string_lossy();
+
+                        // Compose interpolates into the file text before parsing
+                        // it, so this has to run on the raw string.
+                        let yaml_content =
+                            interpolate_variables(&file_label, &yaml_content, &variables)?;
 
                         let compose_config: ComposeFile = serde_yaml::from_str(&yaml_content)?;
 
@@ -1785,6 +1917,144 @@ mod tests {
                 .env_file,
             Some(EnvFile::Many(paths)) if paths.len() == 2
         ));
+    }
+
+    #[test]
+    fn interpolate_leaves_text_without_variables_unchanged() {
+        let yaml = "services:\n  db:\n    image: postgres:18.1\n";
+        assert_eq!(
+            interpolate_variables("core.yaml", yaml, &variables(&[])).expect("no variables"),
+            yaml
+        );
+    }
+
+    #[test]
+    fn interpolate_substitutes_a_braced_variable() {
+        let interpolated = interpolate_variables(
+            "api_gateway.yaml",
+            "      - ADMIN_KEY=${APISIX_ADMIN_KEY}\n",
+            &variables(&[("APISIX_ADMIN_KEY", "s3cret")]),
+        )
+        .expect("set variable");
+        assert_eq!(interpolated, "      - ADMIN_KEY=s3cret\n");
+    }
+
+    #[test]
+    fn interpolate_substitutes_repeated_and_adjacent_variables() {
+        let interpolated = interpolate_variables(
+            "core.yaml",
+            "${A}${B}-${A}",
+            &variables(&[("A", "one"), ("B", "two")]),
+        )
+        .expect("set variables");
+        assert_eq!(interpolated, "onetwo-one");
+    }
+
+    #[test]
+    fn interpolate_uses_the_default_when_unset_or_empty() {
+        for value in [None, Some("")] {
+            let host = match value {
+                Some(value) => variables(&[("LOG_LEVEL", value)]),
+                None => variables(&[]),
+            };
+            let interpolated =
+                interpolate_variables("core.yaml", "${LOG_LEVEL:-info}", &host).expect("default");
+            assert_eq!(interpolated, "info", "for host value [{:?}]", value);
+        }
+    }
+
+    #[test]
+    fn interpolate_prefers_a_set_value_over_the_default() {
+        let interpolated = interpolate_variables(
+            "core.yaml",
+            "${LOG_LEVEL:-info}",
+            &variables(&[("LOG_LEVEL", "debug")]),
+        )
+        .expect("set variable");
+        assert_eq!(interpolated, "debug");
+    }
+
+    #[test]
+    fn interpolate_allows_an_empty_default() {
+        let interpolated = interpolate_variables("core.yaml", "a${MISSING:-}b", &variables(&[]))
+            .expect("empty default");
+        assert_eq!(interpolated, "ab");
+    }
+
+    #[test]
+    fn interpolate_keeps_an_explicitly_empty_value() {
+        // Set-to-empty is the operator's choice, unlike unset.
+        let interpolated =
+            interpolate_variables("core.yaml", "a${EMPTY}b", &variables(&[("EMPTY", "")]))
+                .expect("empty value");
+        assert_eq!(interpolated, "ab");
+    }
+
+    #[test]
+    fn interpolate_unescapes_a_doubled_dollar() {
+        // Without this a literal `$` in a password could not be written.
+        let interpolated =
+            interpolate_variables("core.yaml", "PASSWORD=a$$b$$", &variables(&[])).expect("escape");
+        assert_eq!(interpolated, "PASSWORD=a$b$");
+    }
+
+    #[test]
+    fn interpolate_leaves_a_lone_dollar_alone() {
+        let interpolated = interpolate_variables("core.yaml", "cost: $ 5 and $-", &variables(&[]))
+            .expect("literal");
+        assert_eq!(interpolated, "cost: $ 5 and $-");
+    }
+
+    #[test]
+    fn interpolate_rejects_an_unset_variable_without_a_default() {
+        // The whole point of the deviation from Compose: an unset admin key
+        // must fail the load, not boot APISIX with an empty one.
+        match interpolate_variables(
+            "api_gateway.yaml",
+            "      - ADMIN_KEY=${APISIX_ADMIN_KEY}\n",
+            &variables(&[]),
+        ) {
+            Err(DockerModuleError::UnsetVariable { file, variable }) => {
+                assert_eq!(file, "api_gateway.yaml");
+                assert_eq!(variable, "APISIX_ADMIN_KEY");
+            }
+            other => panic!("expected UnsetVariable, got ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn interpolate_rejects_an_unbraced_variable() {
+        // Passing `$VAR` through untouched is the silent misconfiguration this
+        // feature exists to remove.
+        assert!(matches!(
+            interpolate_variables("core.yaml", "KEY=$APISIX_ADMIN_KEY", &variables(&[])),
+            Err(DockerModuleError::InvalidVariableReference { .. })
+        ));
+    }
+
+    #[test]
+    fn interpolate_rejects_an_unterminated_reference() {
+        assert!(matches!(
+            interpolate_variables("core.yaml", "KEY=${UNCLOSED", &variables(&[])),
+            Err(DockerModuleError::InvalidVariableReference { .. })
+        ));
+    }
+
+    #[test]
+    fn interpolate_rejects_unsupported_reference_forms() {
+        // `-` without the colon and `:?` are real Compose syntax that is not
+        // implemented; reading them as a variable name would silently produce
+        // the wrong value.
+        for reference in ["${VAR-default}", "${VAR:?required}", "${}", "${A B}"] {
+            assert!(
+                matches!(
+                    interpolate_variables("core.yaml", reference, &variables(&[])),
+                    Err(DockerModuleError::InvalidVariableReference { .. })
+                ),
+                "expected [{}] to be rejected",
+                reference
+            );
+        }
     }
 
     #[test]
