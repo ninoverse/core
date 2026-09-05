@@ -12,9 +12,10 @@ use bollard::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use serde_yaml::Value;
 use std::sync::Arc;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fs,
     path::{Component, Path, PathBuf},
 };
@@ -49,7 +50,9 @@ pub struct ServiceConfig {
     pub volumes: Option<Vec<VolumeSpec>>,
     #[serde(skip)]
     pub mounts: Vec<ResolvedMount>,
-    pub environment: Option<Vec<String>>,
+    pub environment: Option<Environment>,
+    #[serde(skip)]
+    pub env: Vec<String>,
     pub container_name: Option<String>,
     pub command: Option<String>,
     pub user: Option<String>,
@@ -116,6 +119,18 @@ pub enum VolumeSpec {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+pub enum Environment {
+    /// `environment: [KEY=VALUE, KEY]`
+    List(Vec<String>),
+    /// `environment: { KEY: value, KEY: }` — the values are `serde_yaml::Value`
+    /// rather than `String` because a compose file may write `REPLICAS: 3` or
+    /// `DEBUG: true`, and serde will not coerce a YAML integer or bool into a
+    /// `String`. `Value::Null` is the bare `KEY:` inherit-from-host form.
+    Map(HashMap<String, Value>),
+}
+
+#[derive(Deserialize)]
 pub struct LongVolumeSpec {
     #[serde(rename = "type")]
     pub mount_type: String,
@@ -166,6 +181,11 @@ pub enum DockerModuleError {
     /// unterminated quote or a trailing backslash.
     #[error("Service [{service}] has a malformed command: {command}")]
     InvalidCommand { service: String, command: String },
+
+    /// A service's `environment` could not be resolved — a non-scalar mapping
+    /// value, or (once `env_file` lands) an unreadable or malformed env file.
+    #[error("Service [{service}] has an invalid environment: {detail}")]
+    InvalidEnvironment { service: String, detail: String },
 
     #[error("Service [{service}] depends on unknown service [{dependency}]")]
     UnknownDependency { service: String, dependency: String },
@@ -239,6 +259,73 @@ fn resolve_command(
                 })
         }
     }
+}
+
+/// Merge a service's `environment` into the `KEY=VALUE` list Docker expects.
+/// Both the list form (`- KEY=VALUE`, `- KEY`) and the mapping form
+/// (`KEY: value`, `KEY:`) are accepted. A key given without a value inherits
+/// from `variables` and is dropped when unset, matching Compose — a bare key
+/// asks for a value to be passed through if present, unlike `${VAR}`, which
+/// declares it required.
+fn resolve_environment(
+    service_name: &str,
+    environment: Option<Environment>,
+    variables: &BTreeMap<String, String>,
+) -> Result<Vec<String>, DockerModuleError> {
+    // A map rather than a Vec: Docker resolves a duplicated key to the last
+    // occurrence, so collapsing them here keeps what the container sees and
+    // what the compose file says in agreement.
+    let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+
+    match environment {
+        None => {}
+        Some(Environment::List(entries)) => {
+            for entry in entries {
+                match entry.split_once('=') {
+                    Some((key, value)) => {
+                        resolved.insert(key.trim().to_string(), value.to_string());
+                    }
+                    None => {
+                        let key = entry.trim();
+                        if let Some(inherited) = variables.get(key) {
+                            resolved.insert(key.to_string(), inherited.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Some(Environment::Map(entries)) => {
+            for (key, value) in entries {
+                match value {
+                    Value::Null => {
+                        if let Some(inherited) = variables.get(&key) {
+                            resolved.insert(key, inherited.clone());
+                        }
+                    }
+                    Value::String(value) => {
+                        resolved.insert(key, value);
+                    }
+                    Value::Number(value) => {
+                        resolved.insert(key, value.to_string());
+                    }
+                    Value::Bool(value) => {
+                        resolved.insert(key, value.to_string());
+                    }
+                    _ => {
+                        return Err(DockerModuleError::InvalidEnvironment {
+                            service: service_name.to_string(),
+                            detail: format!("value of [{}] is not a scalar", key),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(resolved
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", key, value))
+        .collect())
 }
 
 fn is_host_path(source: &str) -> bool {
@@ -417,6 +504,7 @@ fn build_bollard_mount(resolved_mount: &ResolvedMount) -> Mount {
 pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModuleError> {
     let compose_file_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/containers"));
     let mut definitions = DockerDefinitions::default();
+    let variables: BTreeMap<String, String> = env::vars().collect();
 
     if compose_file_dir.exists() && compose_file_dir.is_dir() {
         let compose_files = fs::read_dir(compose_file_dir)?;
@@ -450,6 +538,11 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                                     Some(resolve_restart_policy(config.restart.as_deref())?);
                                 config.command_argv =
                                     resolve_command(&unique_name, config.command.as_deref())?;
+                                config.env = resolve_environment(
+                                    &unique_name,
+                                    config.environment.take(),
+                                    &variables,
+                                )?;
                                 definitions.services.push((unique_name, config));
                             }
                         }
@@ -1003,7 +1096,7 @@ async fn boot_service(
         }
     }
 
-    let environment = service_config.environment.unwrap_or_default();
+    let environment = service_config.env;
 
     let _container_name = service_config.container_name.unwrap_or_default();
 
@@ -1174,6 +1267,18 @@ mod tests {
             .iter()
             .map(|(name, yaml)| (name.to_string(), service_from_yaml(yaml)))
             .collect()
+    }
+
+    fn variables(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn env_of(yaml: &str, variables: &BTreeMap<String, String>) -> Vec<String> {
+        let service = service_from_yaml(yaml);
+        resolve_environment("app", service.environment, variables).expect("valid environment")
     }
 
     #[test]
@@ -1363,6 +1468,119 @@ mod tests {
         assert!(matches!(
             resolve_command("app", Some(r"echo hi \")),
             Err(DockerModuleError::InvalidCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn environment_absent_yields_empty() {
+        assert!(env_of("image: busybox\n", &variables(&[])).is_empty());
+    }
+
+    #[test]
+    fn environment_list_form_passes_values_through() {
+        let env = env_of(
+            "image: busybox\nenvironment:\n  - POSTGRES_USER=nino\n  - POSTGRES_PASSWORD=nino\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["POSTGRES_PASSWORD=nino", "POSTGRES_USER=nino"]);
+    }
+
+    #[test]
+    fn environment_list_form_keeps_explicit_empty_value() {
+        // `KEY=` is the author asking for an empty value, not for the key to be
+        // dropped the way a bare `KEY` is.
+        let env = env_of(
+            "image: busybox\nenvironment:\n  - EMPTY=\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["EMPTY="]);
+    }
+
+    #[test]
+    fn environment_map_form_reads_key_value_pairs() {
+        let env = env_of(
+            "image: busybox\n\
+             environment:\n\
+             \x20 POSTGRES_USER: nino\n\
+             \x20 POSTGRES_PASSWORD: nino\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["POSTGRES_PASSWORD=nino", "POSTGRES_USER=nino"]);
+    }
+
+    #[test]
+    fn environment_map_form_coerces_numbers_and_bools() {
+        // serde will not coerce a YAML integer or bool into a String, so a
+        // `HashMap<String, String>` would fail the parse outright on these.
+        let env = env_of(
+            "image: busybox\n\
+             environment:\n\
+             \x20 REPLICAS: 3\n\
+             \x20 DEBUG: true\n\
+             \x20 RATIO: 1.5\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["DEBUG=true", "RATIO=1.5", "REPLICAS=3"]);
+    }
+
+    #[test]
+    fn environment_map_form_keeps_unquoted_no_as_string() {
+        // Same YAML 1.2 core-schema trap as `restart: no` — `no` stays a
+        // string, so it must not arrive at the container as `false`.
+        let env = env_of(
+            "image: busybox\nenvironment:\n  ANSWER: no\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["ANSWER=no"]);
+    }
+
+    #[test]
+    fn environment_inherits_value_from_host() {
+        // Both spellings of "pass this through from the host": a bare list
+        // entry and a mapping key with a null value.
+        let host = variables(&[("HOME_FROM_HOST", "/home/nino")]);
+        assert_eq!(
+            env_of("image: busybox\nenvironment:\n  - HOME_FROM_HOST\n", &host),
+            vec!["HOME_FROM_HOST=/home/nino"]
+        );
+        assert_eq!(
+            env_of("image: busybox\nenvironment:\n  HOME_FROM_HOST:\n", &host),
+            vec!["HOME_FROM_HOST=/home/nino"]
+        );
+    }
+
+    #[test]
+    fn environment_drops_inherited_key_when_host_is_unset() {
+        // Compose drops it: a bare key asks for a value if present, unlike
+        // `${VAR}`, which declares it required.
+        assert!(
+            env_of(
+                "image: busybox\nenvironment:\n  - ABSENT\n",
+                &variables(&[])
+            )
+            .is_empty()
+        );
+        assert!(env_of("image: busybox\nenvironment:\n  ABSENT:\n", &variables(&[])).is_empty());
+    }
+
+    #[test]
+    fn environment_last_duplicate_key_wins() {
+        // Docker resolves a duplicated key to the last occurrence; collapsing
+        // it here keeps the container and the compose file in agreement.
+        let env = env_of(
+            "image: busybox\nenvironment:\n  - LEVEL=info\n  - LEVEL=debug\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["LEVEL=debug"]);
+    }
+
+    #[test]
+    fn environment_map_form_rejects_non_scalar_value() {
+        let service =
+            service_from_yaml("image: busybox\nenvironment:\n  NESTED:\n    - one\n    - two\n");
+        assert!(matches!(
+            resolve_environment("app", service.environment, &variables(&[])),
+            Err(DockerModuleError::InvalidEnvironment { .. })
         ));
     }
 }

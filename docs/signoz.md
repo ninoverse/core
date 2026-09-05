@@ -218,8 +218,8 @@ line numbers so the references survive edits.
 
 `ServiceConfig` parses exactly ten compose keys: `image`, `ports`, `networks`,
 `volumes`, `environment`, `container_name`, `command`, `user`, `depends_on`,
-`restart` (plus three `#[serde(skip)]` fields the loader fills in itself —
-`mounts`, `restart_policy`, `command_argv`). No struct uses
+`restart` (plus four `#[serde(skip)]` fields the loader fills in itself —
+`mounts`, `env`, `restart_policy`, `command_argv`). No struct uses
 `deny_unknown_fields`, so everything else is **silently dropped** — the failure is
 invisible, not loud.
 

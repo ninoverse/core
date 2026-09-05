@@ -58,7 +58,7 @@ Docker packaging/deployment story gets built for this crate, not before.
 
 Today the parser (`ServiceConfig`, `src/docker.rs`) understands only a
 narrow slice of the Compose spec: `image`, `ports`, `networks`, `volumes`,
-`environment` (list form only), `container_name`, `command` (string form only),
+`environment`, `container_name`, `command` (string form only),
 `user`, `depends_on`, `restart`. Anything else in a real-world
 `docker-compose.yml` is silently ignored, or makes the parse/boot fail. The
 groups below track what's needed to boot an arbitrary compose file correctly.
@@ -105,9 +105,14 @@ The minimum needed to boot most real compose files correctly. Entries marked
   so a container that starts and immediately crash-loops under
   `restart: unless-stopped` is reported as started. That is what let a broken
   Kafka broker pass startup and surface 60s later as a client timeout.
-- **`environment` map form.** Only the `- KEY=VALUE` list form is accepted
-  (`ServiceConfig.environment: Option<Vec<String>>`). Also accept the
-  `KEY: value` mapping form (and bare `KEY` → inherit from host).
+- [x] **`environment` map form.** Was: only the `- KEY=VALUE` list form was
+  accepted (`ServiceConfig.environment: Option<Vec<String>>`), so a file using
+  the mapping form failed to parse outright. Now both forms resolve into
+  `ServiceConfig.env` via `resolve_environment` — the `Environment` enum carries
+  `serde_yaml::Value` map values so `REPLICAS: 3` and `DEBUG: true` coerce to
+  strings rather than failing the parse, a bare `KEY` (list) or null `KEY:`
+  (map) inherits from the host and is dropped when unset, and a duplicated key
+  collapses to its last occurrence, matching what Docker does with `Env`.
 - **`env_file`.** Load one or many env files (string / list) relative to the
   compose dir and merge under `environment`.
 - **Variable interpolation `${VAR}` / `${VAR:-default}`.** Compose interpolates
