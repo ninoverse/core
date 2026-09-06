@@ -216,30 +216,12 @@ Symbols named in this section live in
 [docker.rs](../crates/core/src/docker.rs); they are given as names rather than
 line numbers so the references survive edits.
 
-`ServiceConfig` parses exactly eleven compose keys: `image`, `ports`, `networks`,
-`volumes`, `environment`, `env_file`, `container_name`, `command`, `user`,
-`depends_on`, `restart` (plus four `#[serde(skip)]` fields the loader fills in —
-`mounts`, `env`, `restart_policy`, `command_argv`). No struct uses
-`deny_unknown_fields`, so everything else is **silently dropped** — the failure is
-invisible, not loud.
-
-### No `entrypoint`
-
-Both one-shot jobs rely on `entrypoint: /bin/sh` + `command: -c '<a && b>'`.
-Here `command` is a single string run through `shlex::split` in
-`resolve_command`, so `&&` arrives as a literal argument to the image's own
-entrypoint rather than being interpreted by a shell.
-
-- `init-clickhouse` can be worked around: swap the image for one with an empty
-  ENTRYPOINT and use `command: 'sh -c "..."'` — the trick `kanidm.yaml`'s
-  `init-volume` already uses with `busybox:1.38.0`.
-- The **migrator cannot be**. Its image entrypoint is the collector binary, so
-  `migrate bootstrap && migrate sync up && migrate async up` would have to be
-  split across three separate containers with no way to order them.
-
-Adding `entrypoint: Option<String>` to `ServiceConfig` and passing it through to
-`ContainerCreateBody.entrypoint` is a small, contained change that removes this
-entire class of workaround.
+`ServiceConfig` parses exactly twelve compose keys: `image`, `ports`, `networks`,
+`volumes`, `environment`, `env_file`, `container_name`, `command`, `entrypoint`,
+`user`, `depends_on`, `restart` (plus five `#[serde(skip)]` fields the loader
+fills in — `mounts`, `env`, `restart_policy`, `command_argv`, `entrypoint_argv`).
+No struct uses `deny_unknown_fields`, so everything else is **silently dropped**
+— the failure is invisible, not loud.
 
 ### No `healthcheck`, so `service_healthy` is not a real gate
 
@@ -265,8 +247,19 @@ it says. Tracked in [TODO.md](../TODO.md).
 
 ### Resolved since this was written
 
-Three blockers this document originally recorded have since been fixed:
+Four blockers this document originally recorded have since been fixed:
 
+- **`entrypoint` is parsed, in both forms.** Both one-shot jobs rely on
+  `entrypoint: /bin/sh` + `command: -c '<a && b>'`, which this loader could not
+  express at all: `init-clickhouse` had a workaround (swap in an image with an
+  empty ENTRYPOINT and use `command: 'sh -c "..."'`, the trick `kanidm.yaml`'s
+  `init-volume` uses with `busybox:1.38.0`), but the **migrator had none** — its
+  image entry point is the collector binary, so
+  `migrate bootstrap && migrate sync up && migrate async up` would have had to be
+  split across three containers with no way to order them. `entrypoint:` now
+  resolves through `resolve_entrypoint` into `ContainerCreateBody.entrypoint`.
+  Note the shipped type is `Option<CommandSpec>`, not the `Option<String>` this
+  document originally proposed — see the list form below.
 - **`depends_on` is honored.** Both the list form and the long form with
   `condition: service_started | service_healthy |
   service_completed_successfully` parse into `DependsOn` /
@@ -286,9 +279,12 @@ Three blockers this document originally recorded have since been fixed:
 
 ### Smaller sharp edges
 
-- **`command` must be a scalar string.** A YAML sequence fails deserialization of
-  the *entire file*, aborting startup. The deleted `logs_signoz.yaml` used
-  `command: [ "-config.file=/etc/tempo.yaml" ]` and would not parse today.
+- **`command` and `entrypoint` take both forms.** A YAML sequence used to fail
+  deserialization of the *entire file*, aborting startup — the deleted
+  `logs_signoz.yaml` used `command: [ "-config.file=/etc/tempo.yaml" ]` and would
+  not have parsed. Both keys now accept the shell string (split by `shlex`) and
+  the list (taken verbatim) via `CommandSpec`, so an upstream file can be ported
+  without rewriting its quoting.
 - **`ports` are always `/tcp`.** `host:container` and `ip:host:container` both
   parse now, so a loopback-only binding like `haproxy.yaml`'s
   `"127.0.0.1:5432:5432"` is honored. But the protocol is hardcoded — a `/udp`
@@ -350,21 +346,19 @@ lockstep with the chosen keys.
 
 Recommended order:
 
-1. **Add `entrypoint: Option<String>`** to `ServiceConfig` and wire it to
-   `ContainerCreateBody.entrypoint`. Without it the migrator is not expressible.
-2. **Parse `healthcheck`** and pass it to `bollard`, so the
+1. **Parse `healthcheck`** and pass it to `bollard`, so the
    `condition: service_healthy` gates SigNoz's ordering contract depends on
    actually wait for readiness rather than for "running".
-3. Then vendor the ClickHouse configs under `containers/config/signoz/`, write
+2. Then vendor the ClickHouse configs under `containers/config/signoz/`, write
    `containers/signoz.yaml` with `signoz-`-prefixed keys, add the `signoz_out`
    sink to `config/vector.yaml`, add the HAProxy ACL entry, and record the new
    hostname in the certbot SAN list.
-4. Remove the `# signoz:` placeholder from `observability_ui.yaml`.
+3. Remove the `# signoz:` placeholder from `observability_ui.yaml`.
 
-Steps 1 and 2 are independently useful — they fix latent problems that exist
-regardless of whether SigNoz is ever adopted. The two other prerequisites this
-document originally listed (one-shot handling and `depends_on`) have since
-landed; see §4.
+Step 1 is independently useful — it fixes a latent problem that exists
+regardless of whether SigNoz is ever adopted. The three other prerequisites this
+document originally listed (`entrypoint`, one-shot handling and `depends_on`)
+have since landed; see §4.
 
 ### Unrelated, but found while surveying
 
