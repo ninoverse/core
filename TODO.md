@@ -154,7 +154,7 @@ The minimum needed to boot most real compose files correctly. Entries marked
   `entrypoint: []` resolves to an empty argv, which Docker reads as *clear the
   image's entry point*. That is deliberately not symmetric with `command:` — an
   empty `Cmd` means unset, so the image's default command still runs. Landed in
-  `7df26a5`.
+  `f4f3538`.
 - [x] **`command` / `entrypoint` list form.** Was: only the string (shell) form
   was parsed (`ServiceConfig.command: Option<String>`), so a YAML sequence
   failed deserialization of the *entire compose file* and aborted startup rather
@@ -163,7 +163,7 @@ The minimum needed to boot most real compose files correctly. Entries marked
   line split by `shlex::split`, the list form is already argv and is taken
   verbatim. Re-splitting the list form is the bug this prevents — it would break
   every element holding a space, and hand `&&` to the image's entry point as a
-  literal argument instead of to a shell. Landed in `7df26a5`.
+  literal argument instead of to a shell. Landed in `f4f3538`.
 - **Use `container_name`.** It is parsed but discarded (`_container_name`,
   in `boot_service`); containers are always named after the service key, via
   `CreateContainerOptions.name`. Because the service key is also the DNS name
