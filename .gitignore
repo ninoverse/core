@@ -13,5 +13,8 @@ sonarqube/.sonar-token
 # provisioned oauth2 client secrets, apisix session secret and admin key
 secrets/
 
+# host values interpolated into the compose files -- same reason as secrets/
+.env
+
 # editor
 .vscode/

@@ -12,9 +12,10 @@ use bollard::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use serde_yaml::Value;
 use std::sync::Arc;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fs,
     path::{Component, Path, PathBuf},
 };
@@ -49,7 +50,10 @@ pub struct ServiceConfig {
     pub volumes: Option<Vec<VolumeSpec>>,
     #[serde(skip)]
     pub mounts: Vec<ResolvedMount>,
-    pub environment: Option<Vec<String>>,
+    pub environment: Option<Environment>,
+    pub env_file: Option<EnvFile>,
+    #[serde(skip)]
+    pub env: Vec<String>,
     pub container_name: Option<String>,
     pub command: Option<String>,
     pub user: Option<String>,
@@ -116,6 +120,27 @@ pub enum VolumeSpec {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+pub enum Environment {
+    /// `environment: [KEY=VALUE, KEY]`
+    List(Vec<String>),
+    /// `environment: { KEY: value, KEY: }` — the values are `serde_yaml::Value`
+    /// rather than `String` because a compose file may write `REPLICAS: 3` or
+    /// `DEBUG: true`, and serde will not coerce a YAML integer or bool into a
+    /// `String`. `Value::Null` is the bare `KEY:` inherit-from-host form.
+    Map(HashMap<String, Value>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum EnvFile {
+    /// `env_file: ./db.env`
+    Single(String),
+    /// `env_file: [./db.env, ./shared.env]`
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
 pub struct LongVolumeSpec {
     #[serde(rename = "type")]
     pub mount_type: String,
@@ -166,6 +191,29 @@ pub enum DockerModuleError {
     /// unterminated quote or a trailing backslash.
     #[error("Service [{service}] has a malformed command: {command}")]
     InvalidCommand { service: String, command: String },
+
+    /// A service's environment could not be resolved — a non-scalar mapping
+    /// value, or an unreadable or malformed `env_file`.
+    #[error("Service [{service}] has an invalid environment: {detail}")]
+    InvalidEnvironment { service: String, detail: String },
+
+    /// A compose file references a variable that is unset and carries no `:-`
+    /// default. Compose warns and substitutes empty here; that would boot a
+    /// service with an unset secret instead of failing the load.
+    #[error("Compose file [{file}] references unset variable [{variable}]")]
+    UnsetVariable { file: String, variable: String },
+
+    /// `${VAR:?message}` — the same requirement as `${VAR}`, but the compose
+    /// author supplied the message to fail with.
+    #[error("Compose file [{file}] is missing required variable [{variable}]: {message}")]
+    RequiredVariable {
+        file: String,
+        variable: String,
+        message: String,
+    },
+
+    #[error("Compose file [{file}] has a malformed variable reference: {detail}")]
+    InvalidVariableReference { file: String, detail: String },
 
     #[error("Service [{service}] depends on unknown service [{dependency}]")]
     UnknownDependency { service: String, dependency: String },
@@ -239,6 +287,266 @@ fn resolve_command(
                 })
         }
     }
+}
+
+/// Parse the `KEY=VALUE` lines of an env file. The caller owns the file read, so
+/// this stays a pure function over the content. Blank lines and `#` comments are
+/// skipped; the split is on the first `=` so a value may itself contain one; one
+/// layer of matching surrounding quotes is stripped. `export KEY=…` prefixes,
+/// multi-line values, and interpolation inside env files are not supported.
+fn parse_env_file_content(content: &str) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("line [{}] is not KEY=VALUE", line))?;
+
+        let value = value.trim();
+        let unquoted = match value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            Some(unquoted) => unquoted,
+            None => value
+                .strip_prefix('\'')
+                .and_then(|v| v.strip_suffix('\''))
+                .unwrap_or(value),
+        };
+
+        entries.push((key.trim().to_string(), unquoted.to_string()));
+    }
+
+    Ok(entries)
+}
+
+/// Collect the variables available for interpolation: `.env` from the compose
+/// directory, with the host environment overlaid on top so the host wins —
+/// Compose's precedence. A missing `.env` is not an error.
+///
+/// A malformed `.env` is warned about and skipped rather than fatal: it is an
+/// operator-local convenience file, and any `${VAR}` that actually needed a
+/// value from it still fails loudly, with `UnsetVariable` naming the variable.
+fn load_interpolation_variables(compose_file_dir: &Path) -> BTreeMap<String, String> {
+    let mut variables = BTreeMap::new();
+
+    if let Ok(content) = fs::read_to_string(compose_file_dir.join(".env")) {
+        match parse_env_file_content(&content) {
+            Ok(entries) => variables.extend(entries),
+            Err(detail) => warn!(
+                ["DOCKER_INIT"],
+                "Ignoring malformed .env in [{}]: {}",
+                compose_file_dir.display(),
+                detail
+            ),
+        }
+    }
+
+    variables.extend(env::vars());
+    variables
+}
+
+/// What to do when a `${VAR}` reference resolves to nothing.
+enum Fallback<'a> {
+    /// `${VAR:-default}` — substitute this instead.
+    Default(&'a str),
+    /// `${VAR}` (empty message) or `${VAR:?message}` — fail the load.
+    Required(&'a str),
+}
+
+/// Substitute `${VAR}`, `${VAR:-default}` and `${VAR:?message}` into the compose
+/// text before it is parsed, the way Compose does. `$$` is a literal `$`.
+///
+/// Deliberately narrower than Compose in two places, both to trade a silent
+/// misconfiguration for a loud one: an unset variable with no default is an
+/// error rather than an empty string, and an unbraced `$VAR` is rejected rather
+/// than passed through untouched. `${VAR-default}` (no colon) is not supported
+/// and is reported as malformed rather than read as a variable name.
+fn interpolate_variables(
+    file_label: &str,
+    content: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<String, DockerModuleError> {
+    let mut interpolated = String::with_capacity(content.len());
+    let mut rest = content;
+
+    while let Some(index) = rest.find('$') {
+        interpolated.push_str(&rest[..index]);
+        let after = &rest[index + 1..];
+
+        if let Some(tail) = after.strip_prefix('$') {
+            interpolated.push('$');
+            rest = tail;
+            continue;
+        }
+
+        let Some(tail) = after.strip_prefix('{') else {
+            if after
+                .starts_with(|character: char| character.is_ascii_alphabetic() || character == '_')
+            {
+                let name: String = after
+                    .chars()
+                    .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                    .collect();
+                return Err(DockerModuleError::InvalidVariableReference {
+                    file: file_label.to_string(),
+                    detail: format!("[${name}] must be written [${{{name}}}]"),
+                });
+            }
+            interpolated.push('$');
+            rest = after;
+            continue;
+        };
+
+        let Some(end) = tail.find('}') else {
+            return Err(DockerModuleError::InvalidVariableReference {
+                file: file_label.to_string(),
+                detail: "unterminated [${]".to_string(),
+            });
+        };
+        let reference = &tail[..end];
+        rest = &tail[end + 1..];
+
+        let (name, fallback) = match reference.split_once(":-") {
+            Some((name, default)) => (name, Fallback::Default(default)),
+            None => match reference.split_once(":?") {
+                Some((name, message)) => (name, Fallback::Required(message)),
+                None => (reference, Fallback::Required("")),
+            },
+        };
+
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(DockerModuleError::InvalidVariableReference {
+                file: file_label.to_string(),
+                detail: format!("[${{{reference}}}] is not a variable name"),
+            });
+        }
+
+        let value = match (variables.get(name).map(String::as_str), fallback) {
+            (Some(value), _) if !value.is_empty() => value,
+            // `:-` falls back when the variable is unset *or* set to empty,
+            // matching the shell and Compose.
+            (_, Fallback::Default(default)) => default,
+            // Set to empty with no default is the operator's explicit choice,
+            // unlike an unset variable.
+            (Some(empty), Fallback::Required(_)) => empty,
+            (None, Fallback::Required(message)) if !message.is_empty() => {
+                return Err(DockerModuleError::RequiredVariable {
+                    file: file_label.to_string(),
+                    variable: name.to_string(),
+                    message: message.to_string(),
+                });
+            }
+            (None, Fallback::Required(_)) => {
+                return Err(DockerModuleError::UnsetVariable {
+                    file: file_label.to_string(),
+                    variable: name.to_string(),
+                });
+            }
+        };
+        interpolated.push_str(value);
+    }
+
+    interpolated.push_str(rest);
+    Ok(interpolated)
+}
+
+/// Merge a service's `env_file` and `environment` into the `KEY=VALUE` list
+/// Docker expects. Both the list form (`- KEY=VALUE`, `- KEY`) and the mapping
+/// form (`KEY: value`, `KEY:`) are accepted. A key given without a value
+/// inherits from `variables` and is dropped when unset, matching Compose — a
+/// bare key asks for a value to be passed through if present, unlike `${VAR}`,
+/// which declares it required. Compose precedence: env files in the order
+/// listed, then inline `environment` on top.
+fn resolve_environment(
+    service_name: &str,
+    environment: Option<Environment>,
+    env_file: Option<EnvFile>,
+    variables: &BTreeMap<String, String>,
+    compose_dir: &Path,
+) -> Result<Vec<String>, DockerModuleError> {
+    // A map rather than a Vec: Docker resolves a duplicated key to the last
+    // occurrence, so collapsing them here keeps what the container sees and
+    // what the compose file says in agreement.
+    let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+
+    let env_files = match env_file {
+        None => Vec::new(),
+        Some(EnvFile::Single(path)) => vec![path],
+        Some(EnvFile::Many(paths)) => paths,
+    };
+
+    for entry in env_files {
+        let path = resolve_host_path(&entry, compose_dir)?;
+        let content =
+            fs::read_to_string(&path).map_err(|source| DockerModuleError::InvalidEnvironment {
+                service: service_name.to_string(),
+                detail: format!("cannot read env_file [{}]: {}", path.display(), source),
+            })?;
+        let parsed = parse_env_file_content(&content).map_err(|detail| {
+            DockerModuleError::InvalidEnvironment {
+                service: service_name.to_string(),
+                detail: format!("env_file [{}]: {}", path.display(), detail),
+            }
+        })?;
+        resolved.extend(parsed);
+    }
+
+    match environment {
+        None => {}
+        Some(Environment::List(entries)) => {
+            for entry in entries {
+                match entry.split_once('=') {
+                    Some((key, value)) => {
+                        resolved.insert(key.trim().to_string(), value.to_string());
+                    }
+                    None => {
+                        let key = entry.trim();
+                        if let Some(inherited) = variables.get(key) {
+                            resolved.insert(key.to_string(), inherited.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Some(Environment::Map(entries)) => {
+            for (key, value) in entries {
+                match value {
+                    Value::Null => {
+                        if let Some(inherited) = variables.get(&key) {
+                            resolved.insert(key, inherited.clone());
+                        }
+                    }
+                    Value::String(value) => {
+                        resolved.insert(key, value);
+                    }
+                    Value::Number(value) => {
+                        resolved.insert(key, value.to_string());
+                    }
+                    Value::Bool(value) => {
+                        resolved.insert(key, value.to_string());
+                    }
+                    _ => {
+                        return Err(DockerModuleError::InvalidEnvironment {
+                            service: service_name.to_string(),
+                            detail: format!("value of [{}] is not a scalar", key),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(resolved
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", key, value))
+        .collect())
 }
 
 fn is_host_path(source: &str) -> bool {
@@ -417,6 +725,7 @@ fn build_bollard_mount(resolved_mount: &ResolvedMount) -> Mount {
 pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModuleError> {
     let compose_file_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/containers"));
     let mut definitions = DockerDefinitions::default();
+    let variables = load_interpolation_variables(compose_file_dir);
 
     if compose_file_dir.exists() && compose_file_dir.is_dir() {
         let compose_files = fs::read_dir(compose_file_dir)?;
@@ -428,6 +737,12 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                     if extension == "yml" || extension == "yaml" {
                         let yaml_content = fs::read_to_string(&path)?;
                         let compose_dir = path.parent().unwrap_or(compose_file_dir);
+                        let file_label = path.file_name().unwrap_or_default().to_string_lossy();
+
+                        // Compose interpolates into the file text before parsing
+                        // it, so this has to run on the raw string.
+                        let yaml_content =
+                            interpolate_variables(&file_label, &yaml_content, &variables)?;
 
                         let compose_config: ComposeFile = serde_yaml::from_str(&yaml_content)?;
 
@@ -450,6 +765,13 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                                     Some(resolve_restart_policy(config.restart.as_deref())?);
                                 config.command_argv =
                                     resolve_command(&unique_name, config.command.as_deref())?;
+                                config.env = resolve_environment(
+                                    &unique_name,
+                                    config.environment.take(),
+                                    config.env_file.take(),
+                                    &variables,
+                                    compose_dir,
+                                )?;
                                 definitions.services.push((unique_name, config));
                             }
                         }
@@ -1003,7 +1325,7 @@ async fn boot_service(
         }
     }
 
-    let environment = service_config.environment.unwrap_or_default();
+    let environment = service_config.env;
 
     let _container_name = service_config.container_name.unwrap_or_default();
 
@@ -1174,6 +1496,48 @@ mod tests {
             .iter()
             .map(|(name, yaml)| (name.to_string(), service_from_yaml(yaml)))
             .collect()
+    }
+
+    fn variables(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// Resolve a service whose `env_file` entries point at real files, written
+    /// into a temporary directory named after `label` and removed afterwards.
+    /// Env-file paths in `yaml` are relative to that directory.
+    fn env_with_files(label: &str, yaml: &str, files: &[(&str, &str)]) -> Vec<String> {
+        let dir = env::temp_dir().join(format!("core-docker-{}-{}", std::process::id(), label));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for (name, content) in files {
+            fs::write(dir.join(name), content).expect("write env file");
+        }
+
+        let service = service_from_yaml(yaml);
+        let resolved = resolve_environment(
+            "app",
+            service.environment,
+            service.env_file,
+            &variables(&[]),
+            &dir,
+        );
+
+        fs::remove_dir_all(&dir).expect("clean up temp dir");
+        resolved.expect("valid environment")
+    }
+
+    fn env_of(yaml: &str, variables: &BTreeMap<String, String>) -> Vec<String> {
+        let service = service_from_yaml(yaml);
+        resolve_environment(
+            "app",
+            service.environment,
+            service.env_file,
+            variables,
+            Path::new("/containers"),
+        )
+        .expect("valid environment")
     }
 
     #[test]
@@ -1363,6 +1727,407 @@ mod tests {
         assert!(matches!(
             resolve_command("app", Some(r"echo hi \")),
             Err(DockerModuleError::InvalidCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn environment_absent_yields_empty() {
+        assert!(env_of("image: busybox\n", &variables(&[])).is_empty());
+    }
+
+    #[test]
+    fn environment_list_form_passes_values_through() {
+        let env = env_of(
+            "image: busybox\nenvironment:\n  - POSTGRES_USER=nino\n  - POSTGRES_PASSWORD=nino\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["POSTGRES_PASSWORD=nino", "POSTGRES_USER=nino"]);
+    }
+
+    #[test]
+    fn environment_list_form_keeps_explicit_empty_value() {
+        // `KEY=` is the author asking for an empty value, not for the key to be
+        // dropped the way a bare `KEY` is.
+        let env = env_of(
+            "image: busybox\nenvironment:\n  - EMPTY=\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["EMPTY="]);
+    }
+
+    #[test]
+    fn environment_map_form_reads_key_value_pairs() {
+        let env = env_of(
+            "image: busybox\n\
+             environment:\n\
+             \x20 POSTGRES_USER: nino\n\
+             \x20 POSTGRES_PASSWORD: nino\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["POSTGRES_PASSWORD=nino", "POSTGRES_USER=nino"]);
+    }
+
+    #[test]
+    fn environment_map_form_coerces_numbers_and_bools() {
+        // serde will not coerce a YAML integer or bool into a String, so a
+        // `HashMap<String, String>` would fail the parse outright on these.
+        let env = env_of(
+            "image: busybox\n\
+             environment:\n\
+             \x20 REPLICAS: 3\n\
+             \x20 DEBUG: true\n\
+             \x20 RATIO: 1.5\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["DEBUG=true", "RATIO=1.5", "REPLICAS=3"]);
+    }
+
+    #[test]
+    fn environment_map_form_keeps_unquoted_no_as_string() {
+        // Same YAML 1.2 core-schema trap as `restart: no` — `no` stays a
+        // string, so it must not arrive at the container as `false`.
+        let env = env_of(
+            "image: busybox\nenvironment:\n  ANSWER: no\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["ANSWER=no"]);
+    }
+
+    #[test]
+    fn environment_inherits_value_from_host() {
+        // Both spellings of "pass this through from the host": a bare list
+        // entry and a mapping key with a null value.
+        let host = variables(&[("HOME_FROM_HOST", "/home/nino")]);
+        assert_eq!(
+            env_of("image: busybox\nenvironment:\n  - HOME_FROM_HOST\n", &host),
+            vec!["HOME_FROM_HOST=/home/nino"]
+        );
+        assert_eq!(
+            env_of("image: busybox\nenvironment:\n  HOME_FROM_HOST:\n", &host),
+            vec!["HOME_FROM_HOST=/home/nino"]
+        );
+    }
+
+    #[test]
+    fn environment_drops_inherited_key_when_host_is_unset() {
+        // Compose drops it: a bare key asks for a value if present, unlike
+        // `${VAR}`, which declares it required.
+        assert!(
+            env_of(
+                "image: busybox\nenvironment:\n  - ABSENT\n",
+                &variables(&[])
+            )
+            .is_empty()
+        );
+        assert!(env_of("image: busybox\nenvironment:\n  ABSENT:\n", &variables(&[])).is_empty());
+    }
+
+    #[test]
+    fn environment_last_duplicate_key_wins() {
+        // Docker resolves a duplicated key to the last occurrence; collapsing
+        // it here keeps the container and the compose file in agreement.
+        let env = env_of(
+            "image: busybox\nenvironment:\n  - LEVEL=info\n  - LEVEL=debug\n",
+            &variables(&[]),
+        );
+        assert_eq!(env, vec!["LEVEL=debug"]);
+    }
+
+    #[test]
+    fn env_file_content_skips_comments_and_blank_lines() {
+        let entries = parse_env_file_content(
+            "# a comment\n\nPOSTGRES_USER=nino\n   \n  # indented comment\nDEBUG=true\n",
+        )
+        .expect("valid env file");
+        assert_eq!(
+            entries,
+            vec![
+                ("POSTGRES_USER".to_string(), "nino".to_string()),
+                ("DEBUG".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_content_splits_on_the_first_equals() {
+        // A connection string carries its own `=`; splitting on the last one
+        // (or on every one) would truncate it.
+        let entries = parse_env_file_content("DSN=host=db user=nino\n").expect("valid env file");
+        assert_eq!(
+            entries,
+            vec![("DSN".to_string(), "host=db user=nino".to_string())]
+        );
+    }
+
+    #[test]
+    fn env_file_content_strips_matching_quotes() {
+        let entries =
+            parse_env_file_content("DOUBLE=\"a b\"\nSINGLE='c d'\nBARE=e f\n").expect("valid");
+        assert_eq!(
+            entries,
+            vec![
+                ("DOUBLE".to_string(), "a b".to_string()),
+                ("SINGLE".to_string(), "c d".to_string()),
+                ("BARE".to_string(), "e f".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_content_keeps_unbalanced_quote_verbatim() {
+        // Only a matching pair is a quoting construct; a lone quote is part of
+        // the value.
+        let entries = parse_env_file_content("ODD=\"unclosed\n").expect("valid env file");
+        assert_eq!(entries, vec![("ODD".to_string(), "\"unclosed".to_string())]);
+    }
+
+    #[test]
+    fn env_file_content_rejects_line_without_equals() {
+        assert!(parse_env_file_content("POSTGRES_USER nino\n").is_err());
+    }
+
+    #[test]
+    fn environment_overrides_env_file() {
+        let env = env_with_files(
+            "override",
+            "image: busybox\nenv_file: db.env\nenvironment:\n  - LEVEL=debug\n",
+            &[("db.env", "LEVEL=info\nKEEP=yes\n")],
+        );
+        assert_eq!(env, vec!["KEEP=yes", "LEVEL=debug"]);
+    }
+
+    #[test]
+    fn later_env_file_overrides_earlier() {
+        let env = env_with_files(
+            "ordering",
+            "image: busybox\nenv_file:\n  - base.env\n  - local.env\n",
+            &[
+                ("base.env", "LEVEL=info\nKEEP=yes\n"),
+                ("local.env", "LEVEL=debug\n"),
+            ],
+        );
+        assert_eq!(env, vec!["KEEP=yes", "LEVEL=debug"]);
+    }
+
+    #[test]
+    fn env_file_missing_file_reports_the_path() {
+        let service = service_from_yaml("image: busybox\nenv_file: ./absent.env\n");
+        match resolve_environment(
+            "app",
+            service.environment,
+            service.env_file,
+            &variables(&[]),
+            Path::new("/nonexistent-compose-dir"),
+        ) {
+            Err(DockerModuleError::InvalidEnvironment { service, detail }) => {
+                assert_eq!(service, "app");
+                assert!(
+                    detail.contains("/nonexistent-compose-dir/absent.env"),
+                    "expected the resolved path in [{}]",
+                    detail
+                );
+            }
+            other => panic!("expected InvalidEnvironment, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn env_file_accepts_single_and_list_forms() {
+        // Both spellings must deserialize; the read itself is exercised by the
+        // missing-file case above.
+        assert!(matches!(
+            service_from_yaml("image: busybox\nenv_file: ./one.env\n").env_file,
+            Some(EnvFile::Single(_))
+        ));
+        assert!(matches!(
+            service_from_yaml("image: busybox\nenv_file:\n  - ./one.env\n  - ./two.env\n")
+                .env_file,
+            Some(EnvFile::Many(paths)) if paths.len() == 2
+        ));
+    }
+
+    #[test]
+    fn interpolate_leaves_text_without_variables_unchanged() {
+        let yaml = "services:\n  db:\n    image: postgres:18.1\n";
+        assert_eq!(
+            interpolate_variables("core.yaml", yaml, &variables(&[])).expect("no variables"),
+            yaml
+        );
+    }
+
+    #[test]
+    fn interpolate_substitutes_a_braced_variable() {
+        let interpolated = interpolate_variables(
+            "api_gateway.yaml",
+            "      - ADMIN_KEY=${APISIX_ADMIN_KEY}\n",
+            &variables(&[("APISIX_ADMIN_KEY", "s3cret")]),
+        )
+        .expect("set variable");
+        assert_eq!(interpolated, "      - ADMIN_KEY=s3cret\n");
+    }
+
+    #[test]
+    fn interpolate_substitutes_repeated_and_adjacent_variables() {
+        let interpolated = interpolate_variables(
+            "core.yaml",
+            "${A}${B}-${A}",
+            &variables(&[("A", "one"), ("B", "two")]),
+        )
+        .expect("set variables");
+        assert_eq!(interpolated, "onetwo-one");
+    }
+
+    #[test]
+    fn interpolate_uses_the_default_when_unset_or_empty() {
+        for value in [None, Some("")] {
+            let host = match value {
+                Some(value) => variables(&[("LOG_LEVEL", value)]),
+                None => variables(&[]),
+            };
+            let interpolated =
+                interpolate_variables("core.yaml", "${LOG_LEVEL:-info}", &host).expect("default");
+            assert_eq!(interpolated, "info", "for host value [{:?}]", value);
+        }
+    }
+
+    #[test]
+    fn interpolate_prefers_a_set_value_over_the_default() {
+        let interpolated = interpolate_variables(
+            "core.yaml",
+            "${LOG_LEVEL:-info}",
+            &variables(&[("LOG_LEVEL", "debug")]),
+        )
+        .expect("set variable");
+        assert_eq!(interpolated, "debug");
+    }
+
+    #[test]
+    fn interpolate_allows_an_empty_default() {
+        let interpolated = interpolate_variables("core.yaml", "a${MISSING:-}b", &variables(&[]))
+            .expect("empty default");
+        assert_eq!(interpolated, "ab");
+    }
+
+    #[test]
+    fn interpolate_keeps_an_explicitly_empty_value() {
+        // Set-to-empty is the operator's choice, unlike unset.
+        let interpolated =
+            interpolate_variables("core.yaml", "a${EMPTY}b", &variables(&[("EMPTY", "")]))
+                .expect("empty value");
+        assert_eq!(interpolated, "ab");
+    }
+
+    #[test]
+    fn interpolate_unescapes_a_doubled_dollar() {
+        // Without this a literal `$` in a password could not be written.
+        let interpolated =
+            interpolate_variables("core.yaml", "PASSWORD=a$$b$$", &variables(&[])).expect("escape");
+        assert_eq!(interpolated, "PASSWORD=a$b$");
+    }
+
+    #[test]
+    fn interpolate_leaves_a_lone_dollar_alone() {
+        let interpolated = interpolate_variables("core.yaml", "cost: $ 5 and $-", &variables(&[]))
+            .expect("literal");
+        assert_eq!(interpolated, "cost: $ 5 and $-");
+    }
+
+    #[test]
+    fn interpolate_rejects_an_unset_variable_without_a_default() {
+        // The whole point of the deviation from Compose: an unset admin key
+        // must fail the load, not boot APISIX with an empty one.
+        match interpolate_variables(
+            "api_gateway.yaml",
+            "      - ADMIN_KEY=${APISIX_ADMIN_KEY}\n",
+            &variables(&[]),
+        ) {
+            Err(DockerModuleError::UnsetVariable { file, variable }) => {
+                assert_eq!(file, "api_gateway.yaml");
+                assert_eq!(variable, "APISIX_ADMIN_KEY");
+            }
+            other => panic!("expected UnsetVariable, got ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn interpolate_rejects_an_unbraced_variable() {
+        // Passing `$VAR` through untouched is the silent misconfiguration this
+        // feature exists to remove.
+        assert!(matches!(
+            interpolate_variables("core.yaml", "KEY=$APISIX_ADMIN_KEY", &variables(&[])),
+            Err(DockerModuleError::InvalidVariableReference { .. })
+        ));
+    }
+
+    #[test]
+    fn interpolate_rejects_an_unterminated_reference() {
+        assert!(matches!(
+            interpolate_variables("core.yaml", "KEY=${UNCLOSED", &variables(&[])),
+            Err(DockerModuleError::InvalidVariableReference { .. })
+        ));
+    }
+
+    #[test]
+    fn interpolate_reports_the_authors_message_for_a_required_variable() {
+        // `containers/standalone/redpanda.yaml` already uses this form.
+        match interpolate_variables(
+            "redpanda.yaml",
+            "      - RP_ADMIN_PASSWORD=${RP_ADMIN_PASSWORD:?set RP_ADMIN_PASSWORD first}\n",
+            &variables(&[]),
+        ) {
+            Err(DockerModuleError::RequiredVariable {
+                file,
+                variable,
+                message,
+            }) => {
+                assert_eq!(file, "redpanda.yaml");
+                assert_eq!(variable, "RP_ADMIN_PASSWORD");
+                assert_eq!(message, "set RP_ADMIN_PASSWORD first");
+            }
+            other => panic!("expected RequiredVariable, got ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn interpolate_substitutes_a_set_required_variable() {
+        let interpolated = interpolate_variables(
+            "redpanda.yaml",
+            "${RP_ADMIN_PASSWORD:?required}",
+            &variables(&[("RP_ADMIN_PASSWORD", "hunter2")]),
+        )
+        .expect("set variable");
+        assert_eq!(interpolated, "hunter2");
+    }
+
+    #[test]
+    fn interpolate_rejects_unsupported_reference_forms() {
+        // `-` without the colon is real Compose syntax that is not implemented;
+        // reading it as a variable name would silently produce the wrong value.
+        for reference in ["${VAR-default}", "${}", "${A B}"] {
+            assert!(
+                matches!(
+                    interpolate_variables("core.yaml", reference, &variables(&[])),
+                    Err(DockerModuleError::InvalidVariableReference { .. })
+                ),
+                "expected [{}] to be rejected",
+                reference
+            );
+        }
+    }
+
+    #[test]
+    fn environment_map_form_rejects_non_scalar_value() {
+        let service =
+            service_from_yaml("image: busybox\nenvironment:\n  NESTED:\n    - one\n    - two\n");
+        assert!(matches!(
+            resolve_environment(
+                "app",
+                service.environment,
+                service.env_file,
+                &variables(&[]),
+                Path::new("/containers"),
+            ),
+            Err(DockerModuleError::InvalidEnvironment { .. })
         ));
     }
 }

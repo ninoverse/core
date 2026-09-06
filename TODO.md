@@ -58,7 +58,7 @@ Docker packaging/deployment story gets built for this crate, not before.
 
 Today the parser (`ServiceConfig`, `src/docker.rs`) understands only a
 narrow slice of the Compose spec: `image`, `ports`, `networks`, `volumes`,
-`environment` (list form only), `container_name`, `command` (string form only),
+`environment`, `env_file`, `container_name`, `command` (string form only),
 `user`, `depends_on`, `restart`. Anything else in a real-world
 `docker-compose.yml` is silently ignored, or makes the parse/boot fail. The
 groups below track what's needed to boot an arbitrary compose file correctly.
@@ -105,23 +105,43 @@ The minimum needed to boot most real compose files correctly. Entries marked
   so a container that starts and immediately crash-loops under
   `restart: unless-stopped` is reported as started. That is what let a broken
   Kafka broker pass startup and surface 60s later as a client timeout.
-- **`environment` map form.** Only the `- KEY=VALUE` list form is accepted
-  (`ServiceConfig.environment: Option<Vec<String>>`). Also accept the
-  `KEY: value` mapping form (and bare `KEY` → inherit from host).
-- **`env_file`.** Load one or many env files (string / list) relative to the
-  compose dir and merge under `environment`.
-- **Variable interpolation `${VAR}` / `${VAR:-default}`.** Compose interpolates
-  host env + `.env` into the file before parsing. None of this exists today;
-  many real files depend on it.
-  Concrete case: the APISIX admin key. `init_kanidm_apisix` reads it from
-  `secrets/APISIX_ADMIN_KEY` (`SecretStore::apisix_admin_key` in
-  `init_kanidm_apisix/src/secrets.rs`) to sign its admin calls, and APISIX
-  resolves the same key out of its own container environment. A compose
-  definition for the gateway therefore has to
-  hardcode it, but `secrets/` is gitignored and the real key cannot be
-  committed, so the definition can only carry a placeholder and the two sides
-  are kept in sync by hand. Interpolating from the host environment would let
-  both read one source.
+- [x] **`environment` map form.** Was: only the `- KEY=VALUE` list form was
+  accepted (`ServiceConfig.environment: Option<Vec<String>>`), so a file using
+  the mapping form failed to parse outright. Now both forms resolve into
+  `ServiceConfig.env` via `resolve_environment` — the `Environment` enum carries
+  `serde_yaml::Value` map values so `REPLICAS: 3` and `DEBUG: true` coerce to
+  strings rather than failing the parse, a bare `KEY` (list) or null `KEY:`
+  (map) inherits from the host and is dropped when unset, and a duplicated key
+  collapses to its last occurrence, matching what Docker does with `Env`.
+- [x] **`env_file`.** Was: not parsed at all, so a service keeping its variables
+  in a separate file silently got none of them. Now both the string and list
+  forms load via `resolve_environment`, resolved against the compose dir by
+  `resolve_host_path`, and merge under `environment` with Compose precedence —
+  files in the order listed, then inline `environment` on top. Line parsing
+  lives in `parse_env_file_content`; `export KEY=…` prefixes, multi-line values,
+  and interpolation inside env files are not supported.
+- [x] **Variable interpolation `${VAR}` / `${VAR:-default}`.** Was: absent
+  entirely, so `${VAR}` reached the container as a literal string.
+  `interpolate_variables` now substitutes into the file text before parsing, out
+  of `.env` in the compose directory overlaid by the host environment
+  (`load_interpolation_variables`, host wins). `$$` is a literal `$`.
+  Deliberately narrower than Compose in two places, trading a silent
+  misconfiguration for a loud one: an unset variable with no default is a
+  `DockerModuleError::UnsetVariable` rather than Compose's warn-and-substitute-
+  empty, and an unbraced `$VAR` is rejected rather than passed through.
+  `${VAR:?message}` is supported and reports the author's own message
+  (`RequiredVariable`) — `containers/standalone/redpanda.yaml` already uses it.
+  `${VAR-default}` (no colon) is not implemented and is reported as malformed
+  rather than read as a variable name.
+  The motivating case — the APISIX admin key — is **not yet closed end to end.**
+  `init_kanidm_apisix` reads the key from `secrets/APISIX_ADMIN_KEY`
+  (`SecretStore::apisix_admin_key` in `init_kanidm_apisix/src/secrets.rs`) to
+  sign its admin calls, while APISIX resolves it from its own container
+  environment. The mechanism to let both read one source now exists, but the
+  compose definition that has to adopt it — `containers/api_gateway.yaml`, whose
+  `ADMIN_KEY` is still a hardcoded placeholder — lives on the unmerged
+  `wip/add-docker-definitions-and-configurations` branch. Switching it to
+  `${APISIX_ADMIN_KEY}` is what actually retires the by-hand sync.
 - **`build:`.** Support building an image from a `context` (+ `dockerfile`,
   `args`, `target`) when `image:` is absent. Currently only the `create_image`
   (pull) path in `boot_service` is implemented.
