@@ -55,7 +55,8 @@ pub struct ServiceConfig {
     #[serde(skip)]
     pub env: Vec<String>,
     pub container_name: Option<String>,
-    pub command: Option<String>,
+    pub command: Option<CommandSpec>,
+    pub entrypoint: Option<CommandSpec>,
     pub user: Option<String>,
     pub depends_on: Option<DependsOn>,
     pub restart: Option<String>,
@@ -63,6 +64,8 @@ pub struct ServiceConfig {
     pub restart_policy: Option<RestartPolicy>,
     #[serde(skip)]
     pub command_argv: Option<Vec<String>>,
+    #[serde(skip)]
+    pub entrypoint_argv: Option<Vec<String>>,
 }
 
 impl ServiceConfig {
@@ -131,6 +134,17 @@ pub enum Environment {
     Map(HashMap<String, Value>),
 }
 
+/// The value of `command:` or `entrypoint:` — both keys take the same two
+/// shapes and differ only in which one Docker runs first.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum CommandSpec {
+    /// `command: sh -c "echo hi"` — a shell line, split into argv.
+    Shell(String),
+    /// `command: ["sh", "-c", "echo hi"]` — already argv, taken verbatim.
+    Argv(Vec<String>),
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum EnvFile {
@@ -191,6 +205,11 @@ pub enum DockerModuleError {
     /// unterminated quote or a trailing backslash.
     #[error("Service [{service}] has a malformed command: {command}")]
     InvalidCommand { service: String, command: String },
+
+    /// A service's `entrypoint:` could not be split into arguments — an
+    /// unterminated quote or a trailing backslash.
+    #[error("Service [{service}] has a malformed entrypoint: {entrypoint}")]
+    InvalidEntrypoint { service: String, entrypoint: String },
 
     /// A service's environment could not be resolved — a non-scalar mapping
     /// value, or an unreadable or malformed `env_file`.
@@ -268,24 +287,56 @@ fn resolve_restart_policy(restart: Option<&str>) -> Result<RestartPolicy, Docker
     })
 }
 
-/// Split the compose `command:` string into an argv vector. `shlex::split`
-/// returns `None` on an unterminated quote or trailing backslash; surfacing that
-/// as an error keeps a malformed command from silently falling back to the
-/// image's default command.
+/// Resolve the shell form of `command:` / `entrypoint:` into an argv vector, and
+/// take the list form verbatim. `shlex::split` returns `None` on an unterminated
+/// quote or a trailing backslash; surfacing that keeps a malformed value from
+/// silently falling back to the image's own default. The caller names the key
+/// that failed, so `Err` carries only the line that could not be split.
+fn resolve_argv(spec: CommandSpec) -> Result<Vec<String>, String> {
+    match spec {
+        CommandSpec::Shell(line) => shlex::split(&line).ok_or(line),
+        CommandSpec::Argv(argv) => Ok(argv),
+    }
+}
+
+/// Resolve a service's `command:` into the argv Docker runs. An explicit
+/// `command: ""` resolves to an empty argv, which Docker reads as unset — the
+/// image's own default command then runs. `entrypoint:` differs; see
+/// `resolve_entrypoint`.
 fn resolve_command(
     service_name: &str,
-    command: Option<&str>,
+    command: Option<CommandSpec>,
 ) -> Result<Option<Vec<String>>, DockerModuleError> {
     match command {
         None => Ok(None),
-        Some(command) => {
-            shlex::split(command)
+        Some(spec) => {
+            resolve_argv(spec)
                 .map(Some)
-                .ok_or_else(|| DockerModuleError::InvalidCommand {
+                .map_err(|command| DockerModuleError::InvalidCommand {
                     service: service_name.to_string(),
-                    command: command.to_string(),
+                    command,
                 })
         }
+    }
+}
+
+/// Resolve a service's `entrypoint:` into the entry point Docker runs `command:`
+/// with, overriding the image's own `ENTRYPOINT`. An explicit `entrypoint: ""`
+/// or `entrypoint: []` resolves to an empty argv, which — unlike an empty
+/// `command:` — Docker reads as *clear the image's entry point* rather than as
+/// unset. That is what a compose file asking for an empty entrypoint means.
+fn resolve_entrypoint(
+    service_name: &str,
+    entrypoint: Option<CommandSpec>,
+) -> Result<Option<Vec<String>>, DockerModuleError> {
+    match entrypoint {
+        None => Ok(None),
+        Some(spec) => resolve_argv(spec).map(Some).map_err(|entrypoint| {
+            DockerModuleError::InvalidEntrypoint {
+                service: service_name.to_string(),
+                entrypoint,
+            }
+        }),
     }
 }
 
@@ -764,7 +815,9 @@ pub async fn find_docker_definitions() -> Result<DockerDefinitions, DockerModule
                                 config.restart_policy =
                                     Some(resolve_restart_policy(config.restart.as_deref())?);
                                 config.command_argv =
-                                    resolve_command(&unique_name, config.command.as_deref())?;
+                                    resolve_command(&unique_name, config.command.take())?;
+                                config.entrypoint_argv =
+                                    resolve_entrypoint(&unique_name, config.entrypoint.take())?;
                                 config.env = resolve_environment(
                                     &unique_name,
                                     config.environment.take(),
@@ -1339,6 +1392,7 @@ async fn boot_service(
         }),
         env: Some(environment),
         cmd: service_config.command_argv,
+        entrypoint: service_config.entrypoint_argv,
         user: Some(user),
         ..Default::default()
     };
@@ -1496,6 +1550,18 @@ mod tests {
             .iter()
             .map(|(name, yaml)| (name.to_string(), service_from_yaml(yaml)))
             .collect()
+    }
+
+    fn shell(line: &str) -> Option<CommandSpec> {
+        Some(CommandSpec::Shell(line.to_string()))
+    }
+
+    fn command_of(yaml: &str) -> Result<Option<Vec<String>>, DockerModuleError> {
+        resolve_command("app", service_from_yaml(yaml).command)
+    }
+
+    fn entrypoint_of(yaml: &str) -> Result<Option<Vec<String>>, DockerModuleError> {
+        resolve_entrypoint("app", service_from_yaml(yaml).entrypoint)
     }
 
     fn variables(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -1699,16 +1765,18 @@ mod tests {
 
     #[test]
     fn command_splits_shell_string_into_argv() {
-        let argv = resolve_command("app", Some(r#"sh -c "echo hi""#)).expect("valid command");
+        let argv = resolve_command("app", shell(r#"sh -c "echo hi""#)).expect("valid command");
         assert_eq!(argv, Some(vec!["sh".into(), "-c".into(), "echo hi".into()]));
     }
 
     #[test]
     fn empty_command_yields_empty_argv() {
         // An explicit `command: ""` is a valid parse, not a malformed one, and
-        // must stay distinguishable from the rejected cases below.
+        // must stay distinguishable from the rejected cases below. Docker reads
+        // an empty `Cmd` as unset, so the image's own default command runs —
+        // unlike `entrypoint`, which resets instead. See `resolve_entrypoint`.
         assert_eq!(
-            resolve_command("app", Some("")).expect("valid command"),
+            resolve_command("app", shell("")).expect("valid command"),
             Some(Vec::new())
         );
     }
@@ -1717,7 +1785,7 @@ mod tests {
     fn command_rejects_unterminated_quote() {
         // Without this the container silently runs the image's default command.
         assert!(matches!(
-            resolve_command("init", Some(r#"sh -c "chown -R 8443:8443 /data"#)),
+            resolve_command("init", shell(r#"sh -c "chown -R 8443:8443 /data"#)),
             Err(DockerModuleError::InvalidCommand { .. })
         ));
     }
@@ -1725,8 +1793,97 @@ mod tests {
     #[test]
     fn command_rejects_trailing_backslash() {
         assert!(matches!(
-            resolve_command("app", Some(r"echo hi \")),
+            resolve_command("app", shell(r"echo hi \")),
             Err(DockerModuleError::InvalidCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn command_accepts_shell_and_list_forms() {
+        // A YAML sequence used to fail deserialization of the whole compose
+        // file, aborting startup rather than the one service.
+        assert!(matches!(
+            service_from_yaml("image: busybox\ncommand: sleep infinity\n").command,
+            Some(CommandSpec::Shell(_))
+        ));
+        assert!(matches!(
+            service_from_yaml("image: busybox\ncommand:\n  - sleep\n  - infinity\n").command,
+            Some(CommandSpec::Argv(argv)) if argv.len() == 2
+        ));
+    }
+
+    #[test]
+    fn command_list_form_is_taken_verbatim() {
+        // The list form is already argv, so it must not be re-split: the `&&`
+        // stays inside the one element that carries it, instead of arriving at
+        // the image's own entrypoint as a literal argument.
+        let argv =
+            command_of("image: busybox\ncommand: [\"sh\", \"-c\", \"echo hi && echo bye\"]\n")
+                .expect("valid command");
+        assert_eq!(
+            argv,
+            Some(vec!["sh".into(), "-c".into(), "echo hi && echo bye".into()])
+        );
+    }
+
+    #[test]
+    fn entrypoint_absent_yields_none() {
+        assert_eq!(
+            entrypoint_of("image: busybox\n").expect("no entrypoint"),
+            None
+        );
+    }
+
+    #[test]
+    fn entrypoint_splits_shell_string_into_argv() {
+        let argv =
+            entrypoint_of("image: busybox\nentrypoint: /bin/sh\n").expect("valid entrypoint");
+        assert_eq!(argv, Some(vec!["/bin/sh".into()]));
+    }
+
+    #[test]
+    fn entrypoint_list_form_is_taken_verbatim() {
+        let argv = entrypoint_of("image: busybox\nentrypoint: [\"/bin/sh\", \"-c\"]\n")
+            .expect("valid entrypoint");
+        assert_eq!(argv, Some(vec!["/bin/sh".into(), "-c".into()]));
+    }
+
+    #[test]
+    fn empty_entrypoint_yields_empty_argv() {
+        // An explicit `entrypoint: ""` / `entrypoint: []` is a valid parse, not
+        // a malformed one — it is how a compose file clears the image's own
+        // ENTRYPOINT. `ContainerCreateBody.entrypoint` skips serializing `None`,
+        // so absent stays absent and Docker inherits, while an empty argv is
+        // sent as `"Entrypoint": []` and clears. Contrast
+        // `empty_command_yields_empty_argv`, where an empty `Cmd` means unset.
+        let cleared = Some(Vec::new());
+        assert_eq!(
+            entrypoint_of("image: busybox\nentrypoint: \"\"\n").expect("valid entrypoint"),
+            cleared
+        );
+        assert_eq!(
+            entrypoint_of("image: busybox\nentrypoint: []\n").expect("valid entrypoint"),
+            cleared
+        );
+    }
+
+    #[test]
+    fn entrypoint_rejects_unterminated_quote() {
+        assert!(matches!(
+            resolve_entrypoint("app", shell(r#"/bin/sh -c "echo hi"#)),
+            Err(DockerModuleError::InvalidEntrypoint { .. })
+        ));
+    }
+
+    #[test]
+    fn entrypoint_accepts_shell_and_list_forms() {
+        assert!(matches!(
+            service_from_yaml("image: busybox\nentrypoint: /bin/sh\n").entrypoint,
+            Some(CommandSpec::Shell(_))
+        ));
+        assert!(matches!(
+            service_from_yaml("image: busybox\nentrypoint:\n  - /bin/sh\n  - -c\n").entrypoint,
+            Some(CommandSpec::Argv(argv)) if argv.len() == 2
         ));
     }
 

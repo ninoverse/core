@@ -58,8 +58,8 @@ Docker packaging/deployment story gets built for this crate, not before.
 
 Today the parser (`ServiceConfig`, `src/docker.rs`) understands only a
 narrow slice of the Compose spec: `image`, `ports`, `networks`, `volumes`,
-`environment`, `env_file`, `container_name`, `command` (string form only),
-`user`, `depends_on`, `restart`. Anything else in a real-world
+`environment`, `env_file`, `container_name`, `command`, `entrypoint`, `user`,
+`depends_on`, `restart`. Anything else in a real-world
 `docker-compose.yml` is silently ignored, or makes the parse/boot fail. The
 groups below track what's needed to boot an arbitrary compose file correctly.
 Symbols named below are in `src/docker.rs` unless stated otherwise; they are
@@ -145,11 +145,25 @@ The minimum needed to boot most real compose files correctly. Entries marked
 - **`build:`.** Support building an image from a `context` (+ `dockerfile`,
   `args`, `target`) when `image:` is absent. Currently only the `create_image`
   (pull) path in `boot_service` is implemented.
-- **`entrypoint`.** Not parsed; needed alongside `command` to run most images
-  correctly.
-- **`command` / `entrypoint` list form.** Only the string (shell) form is
-  parsed (`ServiceConfig.command: Option<String>`), split by `shlex::split` in
-  `resolve_command`. Accept the list form too.
+- [x] **`entrypoint`.** Was: not parsed at all, so a service overriding the
+  image's `ENTRYPOINT` was silently ignored and the image's own entry point ran
+  instead. Now resolved at load time into `ServiceConfig.entrypoint_argv` by
+  `resolve_entrypoint` and passed to `ContainerCreateBody.entrypoint` in
+  `boot_service`. An absent `entrypoint:` stays `None`, which is skipped during
+  serialization so Docker inherits the image's; an explicit `entrypoint: ""` or
+  `entrypoint: []` resolves to an empty argv, which Docker reads as *clear the
+  image's entry point*. That is deliberately not symmetric with `command:` — an
+  empty `Cmd` means unset, so the image's default command still runs. Landed in
+  `f4f3538`.
+- [x] **`command` / `entrypoint` list form.** Was: only the string (shell) form
+  was parsed (`ServiceConfig.command: Option<String>`), so a YAML sequence
+  failed deserialization of the *entire compose file* and aborted startup rather
+  than the one service. Both keys now take a `CommandSpec`, an untagged enum
+  over the two shapes, resolved by `resolve_argv`: the string form is a shell
+  line split by `shlex::split`, the list form is already argv and is taken
+  verbatim. Re-splitting the list form is the bug this prevents — it would break
+  every element holding a space, and hand `&&` to the image's entry point as a
+  literal argument instead of to a shell. Landed in `f4f3538`.
 - **Use `container_name`.** It is parsed but discarded (`_container_name`,
   in `boot_service`); containers are always named after the service key, via
   `CreateContainerOptions.name`. Because the service key is also the DNS name
