@@ -25,9 +25,10 @@ it out.
 
 ## What to reconcile
 
-1. **Shipped work still listed as open.** Mark it `[x]` with the commit hash that
-   landed it, and say what the behaviour is now. Keep the entry rather than
-   deleting it; the record of *why* it was a problem is the valuable part.
+1. **Shipped work still listed as open.** Mark it `[x]`, say what the behaviour
+   is now, and name the symbols that implement it — not the commit hash that
+   landed it (see below). Keep the entry rather than deleting it; the record of
+   *why* it was a problem is the valuable part.
 2. **Claims the code contradicts.** A gap described as unfixable, a failure mode
    that no longer reproduces, a key listed as unparsed that is now parsed. Verify
    before repeating — do not carry a claim forward on faith because it was there
@@ -38,7 +39,7 @@ it out.
 
 ---
 
-## Reference code by name, never by line number
+## Reference code by name, never by line number or commit hash
 
 Line numbers drift on the next edit to the file and are wrong by the following
 commit. Name the symbol instead — it moves with the code and it is greppable:
@@ -60,6 +61,25 @@ position: *"the readiness loop in `boot_service`"*, *"the `ports` loop in
 State the file once per section (*"symbols named below are in
 `src/docker.rs`"*) rather than repeating it on every reference.
 
+The same applies to commit hashes, for two reasons. A doc fix ships in the same
+commit as the work it describes, and that commit's hash does not exist until it
+is written — so the line can only ever name a *different* commit, or get amended
+in, which changes the hash it just named. And squash merges rewrite it anyway:
+the hash the author had on the branch is not the one that lands on `main`.
+
+```markdown
+<!-- no -->
+resolved into `ServiceConfig.command_argv`. Landed in `e8d491e`.
+`depends_on` is honored now. (`acfab00`)
+
+<!-- yes -->
+resolved into `ServiceConfig.command_argv` by `resolve_command`.
+`depends_on` is honored by `wait_for_dependency`, in dependency order.
+```
+
+The symbol name is what a reader needs to find the code; `git log --grep` and
+`git blame` answer "which commit landed this" without going stale.
+
 ---
 
 ## Verification gate
@@ -70,8 +90,9 @@ Before committing a doc change, confirm every symbol it names still exists:
 grep -n '<symbol>' crates/<crate>/src/<file>.rs
 ```
 
-And confirm no line references crept back in:
+And confirm no line references or commit hashes crept back in:
 
 ```bash
-grep -nE '\.rs[:#]L?[0-9]' TODO.md docs/*.md    # expect no output
+grep -nE '\.rs[:#]L?[0-9]' TODO.md docs/*.md                  # expect no output
+grep -nE 'Landed in|\(`[0-9a-f]{7,40}`\)' TODO.md docs/*.md   # expect no output
 ```
