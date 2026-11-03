@@ -74,11 +74,11 @@ The minimum needed to boot most real compose files correctly. Entries marked
   shared `Barrier`, so there was no ordering. Now supports the list form and
   the long form with `condition: service_started | service_healthy |
   service_completed_successfully`, and boots in dependency order — `DependsOn`
-  / `DependencyCondition`, `wait_for_dependency`. Landed in `acfab00`.
+  / `DependencyCondition`, `wait_for_dependency`.
 - [x] **`restart` policy.** Was: a hardcoded 5s crash-restart loop. Now
   resolved to the container's `RestartPolicy` (`no`, `always`,
   `on-failure[:max]`, `unless-stopped`) by `resolve_restart_policy` and applied
-  to the `HostConfig` built in `boot_service`. Landed in `57b8094`.
+  to the `HostConfig` built in `boot_service`.
 - [x] **Malformed `command` quoting was swallowed.** Was: `shlex::split`
   returns `None` on an unterminated quote or trailing backslash, and
   `.unwrap_or_default()` turned that into an empty `Vec`. Docker treats an
@@ -86,7 +86,7 @@ The minimum needed to boot most real compose files correctly. Entries marked
   command** instead of the one declared. Now resolved at load time into
   `ServiceConfig.command_argv` by `resolve_command`, so a bad quote aborts
   startup with `DockerModuleError::InvalidCommand` before any container is
-  created. Landed in `e8d491e`.
+  created.
   Concrete failure it prevented: a busybox init service that runs
   `sh -c "chown -R 8443:8443 /data"` to hand a volume to the uid its dependent
   runs as, gated by `service_completed_successfully`. A typo in that quoting
@@ -153,8 +153,7 @@ The minimum needed to boot most real compose files correctly. Entries marked
   serialization so Docker inherits the image's; an explicit `entrypoint: ""` or
   `entrypoint: []` resolves to an empty argv, which Docker reads as *clear the
   image's entry point*. That is deliberately not symmetric with `command:` — an
-  empty `Cmd` means unset, so the image's default command still runs. Landed in
-  `f4f3538`.
+  empty `Cmd` means unset, so the image's default command still runs.
 - [x] **`command` / `entrypoint` list form.** Was: only the string (shell) form
   was parsed (`ServiceConfig.command: Option<String>`), so a YAML sequence
   failed deserialization of the *entire compose file* and aborted startup rather
@@ -163,7 +162,7 @@ The minimum needed to boot most real compose files correctly. Entries marked
   line split by `shlex::split`, the list form is already argv and is taken
   verbatim. Re-splitting the list form is the bug this prevents — it would break
   every element holding a space, and hand `&&` to the image's entry point as a
-  literal argument instead of to a shell. Landed in `f4f3538`.
+  literal argument instead of to a shell.
 - **Use `container_name`.** It is parsed but discarded (`_container_name`,
   in `boot_service`); containers are always named after the service key, via
   `CreateContainerOptions.name`. Because the service key is also the DNS name

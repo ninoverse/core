@@ -265,17 +265,16 @@ Four blockers this document originally recorded have since been fixed:
   service_completed_successfully` parse into `DependsOn` /
   `DependencyCondition`, and services boot in dependency order.
   `validate_dependency_graph` rejects unknown dependencies and cycles up front
-  rather than deadlocking. (`acfab00`)
+  rather than deadlocking.
 - **One-shot containers no longer stall the barrier.** The readiness loop in
   `boot_service` treats a terminal state (`EXITED` / `DEAD`) as launched, so a
-  job that finishes in under a second is not waited on forever (`acfab00`); the
-  loop is also capped and returns `DockerModuleError::ServiceStartTimeout`
-  instead of spinning (`d510d60`). `init-clickhouse` and the migrator are
-  expressible on this point.
+  job that finishes in under a second is not waited on forever; the loop is also
+  capped and returns `DockerModuleError::ServiceStartTimeout` instead of
+  spinning. `init-clickhouse` and the migrator are expressible on this point.
 - **`restart` is honored.** The old hardcoded 5s crash-restart loop is gone;
   `resolve_restart_policy` maps the compose key onto a Docker `RestartPolicy`
   applied via `HostConfig`, so retry behaviour is the daemon's job and no longer
-  masks a genuine ordering failure with a burst of restarts. (`57b8094`)
+  masks a genuine ordering failure with a burst of restarts.
 
 ### Smaller sharp edges
 
