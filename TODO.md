@@ -1,7 +1,7 @@
 # TODO
 
-> **Where the compose definitions live.** `main` carries the loader but no
-> compose files — `crates/core/containers/` holds only a `.gitkeep`, and
+> **Where the compose definitions live.** `main` carries the compose runner but
+> no compose files — `crates/core/containers/` holds only a `.gitkeep`, and
 > `crates/core/config/default.yml` is absent, so a `cargo run` of the `core`
 > binary on `main` fails at configuration load. The actual stack (`haproxy`,
 > `core.yaml`, the `observability_*` files, the vendored `containers/config/`
@@ -9,16 +9,92 @@
 > `wip/add-docker-definitions-and-configurations` branch. Items below that
 > speak of services "in the stack" mean that branch.
 
+## Compose runner
+
+Symbols named in this section are in `crates/core/src/compose.rs` unless
+stated otherwise.
+
+`core` no longer parses compose files itself. `start_compose_stack` hands every
+`*.yaml` / `*.yml` directly inside `containers/` (found by
+`find_compose_files`, sorted, not recursive) to `docker compose up --detach
+--wait` as one project named `PROJECT_NAME` (`ninoverse`), and registers a task
+that runs `docker compose down` — or `stop`, when
+`docker.remove_containers_on_shutdown` is false — once shutdown is broadcast.
+Compose's own output goes straight to the terminal, not through `logger`.
+Docker Compose v2 (the `docker compose` plugin) is a runtime prerequisite.
+
+### Why the hand-rolled loader was dropped
+
+The previous `src/docker.rs` (~2,300 lines) parsed compose files into its own
+`ServiceConfig` and drove `bollard` directly. It covered twelve compose keys and
+silently ignored the rest, so a valid compose file meant something different
+here than under `docker compose`. That cost real bugs: a malformed `command`
+quote ran the image's default command, the `environment` map form failed to
+parse, `entrypoint` was ignored, `container_name` was discarded, and
+`healthcheck` was never parsed — so `condition: service_healthy` degraded to
+"running". The remaining gap list (`build:`, full `ports` syntax, `labels`,
+`deploy`, resource limits, `logging`, security options, network/volume long
+forms, `secrets`/`configs`, `profiles`, `platform`, `pull_policy`, `extends`,
+`stop_signal`/`stop_grace_period`, …) was the whole rest of the spec. Compose
+already implements all of it, and nothing the module added on top was
+something Compose lacks. The orchestration ideas that do go beyond Compose
+(below) only need the Docker API, not ownership of the parser.
+
+### Before merging the wip branch
+
+Checked by running `docker compose config` over that branch's
+`containers/*.yaml`. Everything else merges and validates as one project.
+
+- **Two files make Compose reject the whole project.** `sonarqube.yaml` is
+  commented out entirely (`empty compose file`) and `observability_generator.yaml`
+  keeps a bare `services:` with every entry commented out (`services must be a
+  mapping`). Delete them, move them out of `containers/`, or rename them to a
+  non-`.yaml` extension.
+- **Named volumes change name.** Compose prefixes them with the project name, so
+  `etcd-data` becomes `ninoverse_etcd-data`, and so on. Volumes created by the old
+  loader hold existing data (Postgres, kanidm, Grafana, …) and will **not** be
+  reused. Either set `name: <old-name>` on each top-level volume to keep
+  using them, or copy the data across once.
+- **Networks change name too.** `ninoverse-network` becomes
+  `ninoverse_ninoverse-network`. Service-name DNS is unaffected; set
+  `name: ninoverse-network` if anything outside the project refers to it by
+  name. `etcd-backend`'s `internal: true`, ignored by the old loader, is now
+  honored.
+- **APISIX admin key.** `containers/api_gateway.yaml` still hardcodes `ADMIN_KEY`.
+  `init_kanidm_apisix` reads the key from `secrets/APISIX_ADMIN_KEY`
+  (`SecretStore::apisix_admin_key` in `init_kanidm_apisix/src/secrets.rs`).
+  Switch the compose file to `${APISIX_ADMIN_KEY:?…}` with the value in
+  `containers/.env` to retire the by-hand sync. Use the `:?` form: Compose
+  substitutes an empty string for a plain `${VAR}` that is unset, where the old
+  loader failed.
+
+### Open
+
+- **A crash-looping container without a healthcheck passes `--wait`.** Verified:
+  a service that exits non-zero under `restart: unless-stopped` is reported
+  healthy and `up` exits 0. With a `healthcheck`, `up --wait` fails as it should.
+  This is what let a broken Kafka broker pass startup and surface 60s later as a
+  client timeout. Fix it in the compose files: give every long-running service
+  that others depend on a `healthcheck`, and use `condition: service_healthy`.
+- **`remove_volumes_on_shutdown` and `remove_networks_on_shutdown`** are fields of
+  `DockerConfiguration` (`crates/configuration`) that nothing reads, before or
+  after this change. `down --volumes` would honor the first. The second cannot
+  be honored as `false` with `down`, which always removes the project's
+  networks. Either wire them or remove them.
+- **A service key repeated across files is merged, not reported.** Compose treats
+  later `--file`s as overrides, so two files declaring the same service combine
+  their fields. The old loader created duplicates instead. Neither reports it.
+  `find_compose_files` sorts by name, so the merge order is stable.
+
 ## Resource path resolution: switch to `current_exe()` for deployed binaries
 
-`config/default.yml`, `containers/*.yaml`, and bind-mount sources resolved in
-`resolve_host_path` are currently anchored with `env!("CARGO_MANIFEST_DIR")`
-(the `CONFIG` consts in `crates/core/src/main.rs` and
-`crates/init_kanidm_apisix/src/main.rs`, and `find_docker_definitions` in
-`crates/core/src/docker.rs`, whose compose dir is what `resolve_host_path`
-resolves relative sources against). This is a
-compile-time constant — it bakes the build machine's source checkout path
-(e.g. `/home/nino/repositories/core/crates/core`) directly into the binary.
+`config/default.yml` and `containers/` are currently anchored with
+`env!("CARGO_MANIFEST_DIR")` (the `CONFIG` consts in `crates/core/src/main.rs`
+and `crates/init_kanidm_apisix/src/main.rs`, and `COMPOSE_DIR` in
+`crates/core/src/compose.rs`, which is also the `--project-directory` relative
+bind-mount sources resolve against). This is a compile-time constant — it bakes
+the build machine's source checkout path (e.g.
+`/home/nino/repositories/core/crates/core`) directly into the binary.
 
 This is enough to make `cargo run`/`cargo test` behave the same regardless of
 invocation CWD, which was the immediate problem. It is **not** enough for a
@@ -43,8 +119,8 @@ fn resource_dir() -> std::path::PathBuf {
 }
 ```
 
-Then anchor `config/default`, `containers/`, and bind-mount sources on
-`resource_dir()` instead of `env!("CARGO_MANIFEST_DIR")`.
+Then anchor `config/default` and `containers/` on `resource_dir()` instead of
+`env!("CARGO_MANIFEST_DIR")`.
 
 **Precondition:** this only works if `config/` and `containers/` are
 physically placed next to the compiled binary at runtime, in *every* context
@@ -54,205 +130,13 @@ the binary runs in — plain `cargo run` puts the binary in `target/debug/` or
 co-locate them before this works locally too. Do this alongside whatever
 Docker packaging/deployment story gets built for this crate, not before.
 
-## Docker module: compose-file coverage
-
-Today the parser (`ServiceConfig`, `src/docker.rs`) understands only a
-narrow slice of the Compose spec: `image`, `ports`, `networks`, `volumes`,
-`environment`, `env_file`, `container_name`, `command`, `entrypoint`, `user`,
-`depends_on`, `restart`. Anything else in a real-world
-`docker-compose.yml` is silently ignored, or makes the parse/boot fail. The
-groups below track what's needed to boot an arbitrary compose file correctly.
-Symbols named below are in `src/docker.rs` unless stated otherwise; they are
-given as names rather than line numbers so the references survive edits.
-
-### Main functionalities
-
-The minimum needed to boot most real compose files correctly. Entries marked
-`[x]` are implemented; they are kept for the record rather than deleted.
-
-- [x] **`depends_on` + startup ordering.** Was: every service waited on one
-  shared `Barrier`, so there was no ordering. Now supports the list form and
-  the long form with `condition: service_started | service_healthy |
-  service_completed_successfully`, and boots in dependency order — `DependsOn`
-  / `DependencyCondition`, `wait_for_dependency`.
-- [x] **`restart` policy.** Was: a hardcoded 5s crash-restart loop. Now
-  resolved to the container's `RestartPolicy` (`no`, `always`,
-  `on-failure[:max]`, `unless-stopped`) by `resolve_restart_policy` and applied
-  to the `HostConfig` built in `boot_service`.
-- [x] **Malformed `command` quoting was swallowed.** Was: `shlex::split`
-  returns `None` on an unterminated quote or trailing backslash, and
-  `.unwrap_or_default()` turned that into an empty `Vec`. Docker treats an
-  empty `Cmd` as unset, so the container silently ran the **image's default
-  command** instead of the one declared. Now resolved at load time into
-  `ServiceConfig.command_argv` by `resolve_command`, so a bad quote aborts
-  startup with `DockerModuleError::InvalidCommand` before any container is
-  created.
-  Concrete failure it prevented: a busybox init service that runs
-  `sh -c "chown -R 8443:8443 /data"` to hand a volume to the uid its dependent
-  runs as, gated by `service_completed_successfully`. A typo in that quoting
-  made busybox run its default `sh`, which hits EOF and **exits 0** (verified),
-  satisfying the gate, so the dependent booted as that uid against an unchowned
-  volume. Verified alongside: `"User":""` leaves `Config.User` at the image's
-  value, so the `Some("")` `boot_service` still sends for `user` is harmless.
-- **Parse `healthcheck` + gate a service's own readiness on it.**
-  `wait_for_healthy` already consumes Docker health state for `depends_on:
-  condition: service_healthy`, but `healthcheck` is not a field on
-  `ServiceConfig` at all, so a container defined here never *has* a health
-  state to read — its no-healthcheck fallback degrades to "running". Parse
-  `healthcheck` (`test`, `interval`, `timeout`, `retries`, `start_period`,
-  `disable`) and pass it to `bollard`. Separately, a service's own boot gate
-  (the readiness loop in `boot_service`) still only checks `running`/terminal,
-  so a container that starts and immediately crash-loops under
-  `restart: unless-stopped` is reported as started. That is what let a broken
-  Kafka broker pass startup and surface 60s later as a client timeout.
-- [x] **`environment` map form.** Was: only the `- KEY=VALUE` list form was
-  accepted (`ServiceConfig.environment: Option<Vec<String>>`), so a file using
-  the mapping form failed to parse outright. Now both forms resolve into
-  `ServiceConfig.env` via `resolve_environment` — the `Environment` enum carries
-  `serde_yaml::Value` map values so `REPLICAS: 3` and `DEBUG: true` coerce to
-  strings rather than failing the parse, a bare `KEY` (list) or null `KEY:`
-  (map) inherits from the host and is dropped when unset, and a duplicated key
-  collapses to its last occurrence, matching what Docker does with `Env`.
-- [x] **`env_file`.** Was: not parsed at all, so a service keeping its variables
-  in a separate file silently got none of them. Now both the string and list
-  forms load via `resolve_environment`, resolved against the compose dir by
-  `resolve_host_path`, and merge under `environment` with Compose precedence —
-  files in the order listed, then inline `environment` on top. Line parsing
-  lives in `parse_env_file_content`; `export KEY=…` prefixes, multi-line values,
-  and interpolation inside env files are not supported.
-- [x] **Variable interpolation `${VAR}` / `${VAR:-default}`.** Was: absent
-  entirely, so `${VAR}` reached the container as a literal string.
-  `interpolate_variables` now substitutes into the file text before parsing, out
-  of `.env` in the compose directory overlaid by the host environment
-  (`load_interpolation_variables`, host wins). `$$` is a literal `$`.
-  Deliberately narrower than Compose in two places, trading a silent
-  misconfiguration for a loud one: an unset variable with no default is a
-  `DockerModuleError::UnsetVariable` rather than Compose's warn-and-substitute-
-  empty, and an unbraced `$VAR` is rejected rather than passed through.
-  `${VAR:?message}` is supported and reports the author's own message
-  (`RequiredVariable`) — `containers/standalone/redpanda.yaml` already uses it.
-  `${VAR-default}` (no colon) is not implemented and is reported as malformed
-  rather than read as a variable name.
-  The motivating case — the APISIX admin key — is **not yet closed end to end.**
-  `init_kanidm_apisix` reads the key from `secrets/APISIX_ADMIN_KEY`
-  (`SecretStore::apisix_admin_key` in `init_kanidm_apisix/src/secrets.rs`) to
-  sign its admin calls, while APISIX resolves it from its own container
-  environment. The mechanism to let both read one source now exists, but the
-  compose definition that has to adopt it — `containers/api_gateway.yaml`, whose
-  `ADMIN_KEY` is still a hardcoded placeholder — lives on the unmerged
-  `wip/add-docker-definitions-and-configurations` branch. Switching it to
-  `${APISIX_ADMIN_KEY}` is what actually retires the by-hand sync.
-- **`build:`.** Support building an image from a `context` (+ `dockerfile`,
-  `args`, `target`) when `image:` is absent. Currently only the `create_image`
-  (pull) path in `boot_service` is implemented.
-- [x] **`entrypoint`.** Was: not parsed at all, so a service overriding the
-  image's `ENTRYPOINT` was silently ignored and the image's own entry point ran
-  instead. Now resolved at load time into `ServiceConfig.entrypoint_argv` by
-  `resolve_entrypoint` and passed to `ContainerCreateBody.entrypoint` in
-  `boot_service`. An absent `entrypoint:` stays `None`, which is skipped during
-  serialization so Docker inherits the image's; an explicit `entrypoint: ""` or
-  `entrypoint: []` resolves to an empty argv, which Docker reads as *clear the
-  image's entry point*. That is deliberately not symmetric with `command:` — an
-  empty `Cmd` means unset, so the image's default command still runs.
-- [x] **`command` / `entrypoint` list form.** Was: only the string (shell) form
-  was parsed (`ServiceConfig.command: Option<String>`), so a YAML sequence
-  failed deserialization of the *entire compose file* and aborted startup rather
-  than the one service. Both keys now take a `CommandSpec`, an untagged enum
-  over the two shapes, resolved by `resolve_argv`: the string form is a shell
-  line split by `shlex::split`, the list form is already argv and is taken
-  verbatim. Re-splitting the list form is the bug this prevents — it would break
-  every element holding a space, and hand `&&` to the image's entry point as a
-  literal argument instead of to a shell.
-- **Use `container_name`.** It is parsed but discarded (`_container_name`,
-  in `boot_service`); containers are always named after the service key, via
-  `CreateContainerOptions.name`. Because the service key is also the DNS name
-  on the network, a file whose `container_name` differs from its service key
-  silently breaks every hostname that refers to it — including the container's
-  own env vars. Honor it when present, fall back to the service key otherwise.
-- **Full `ports` short syntax.** Handle `container`-only, `/udp` protocol, and
-  port ranges (`8000-8010:8000-8010`). `host:container` and `ip:host:container`
-  both work today (the `ports` loop in `boot_service`).
-- **`ports` long syntax.** `target` / `published` / `protocol` / `mode`
-  mapping form.
-- **Top-level `name:` (project namespace).** Compose prefixes resources with a
-  project name. The `raw_name.to_string()` / `net.to_string()` calls in
-  `find_docker_definitions` copy the name through unchanged — decide on and
-  apply a real naming/namespacing scheme.
-
-### Nice to have
-
-Common but not required for a basic boot.
-
-- **`labels`** (map and list form) on services, networks, volumes.
-- **`expose`** (documented container ports without host publishing).
-- **`deploy` block:** `resources.limits/reservations` (cpus/memory),
-  `replicas`, `restart_policy`.
-- **Resource limits (v2 style):** `mem_limit`, `mem_reservation`, `cpus`,
-  `cpu_shares`, `pids_limit`, `shm_size`.
-- **`logging`** driver + options → `HostConfig.log_config`.
-- **`working_dir`, `hostname`, `domainname`, `stop_signal`,
-  `stop_grace_period`.**
-- **`extra_hosts`** → `HostConfig.extra_hosts`.
-- **`dns`, `dns_search`.**
-- **`cap_add` / `cap_drop`, `privileged`, `security_opt`, `devices`,
-  `sysctls`, `ulimits`, `read_only`, `init`, `tmpfs`.**
-- **`network_mode`, `pid`, `ipc`, `userns_mode`.**
-- **Network long form per service:** `aliases`, `ipv4_address`, `ipv6_address`
-  (currently only a plain name list, built in `boot_service`). `aliases` would
-  also give `container_name` a natural implementation.
-- **Network top-level options:** `external`, `internal`, `attachable`, `ipam`,
-  `enable_ipv6`, `labels`, `driver_opts` (only `driver` is read on
-  `NetworkConfig`).
-- **Volume top-level options:** `external`, `driver_opts`, `labels`, `name`
-  (only `driver` is read on `VolumeConfig`).
-- **Volume/mount long-syntax sub-options:** `volume.nocopy`,
-  `bind.propagation` / `create_host_path`, `tmpfs.size` / `tmpfs.mode`
-  (`resolve_long_volume` ignores these).
-- **Top-level `secrets` and `configs`** (+ per-service references, file/env
-  sources).
-- **`profiles`** (only start services whose profile is active).
-- **`platform`** per service (currently always `String::new()` in the
-  `CreateContainerOptions` built by `boot_service`).
-- **`pull_policy`** (`always` / `missing` / `never` / `build`) instead of the
-  current always-pull-when-untagged behavior (`resolve_pull_tag`).
-
-### Edge cases
-
-Correctness / robustness gaps that bite on specific files. Entries marked `[x]`
-are implemented; they are kept for the record rather than deleted.
-
-- [x] **Multi-service dependency cycles** in `depends_on` — detected and
-  reported via `validate_dependency_graph` and the
-  `DockerModuleError::DependencyCycle` variant.
-- [x] **`inspect_container(...).unwrap()`** in the readiness loop — no longer
-  panics if the container exits/vanishes during startup; the `Err` propagates
-  with `?` (the readiness loop in `boot_service`).
-- [x] **`panic!` on create/start failure** — all three sites now propagate as
-  `DockerModuleError` and let the caller decide; no `panic!` or `unwrap()`
-  remains outside the test module.
-- **Duplicate resource names across files.** Services/networks/volumes from all
-  `containers/*.yaml` are pushed into flat `Vec`s by `find_docker_definitions`;
-  collisions silently duplicate. Detect and error (or last-wins with a warning).
-- **Ambiguous bind vs. named-volume sources.** `~` / relative binds are handled
-  (`resolve_host_path`), but Windows-style paths and sources that are ambiguous
-  between a named volume and a host path (`is_host_path`) need review.
-- **Empty / partial compose files** (`services:` absent, `null` service body)
-  and non-map YAML — the current parse assumes well-formed structure.
-- **YAML `extends`, anchors/aliases, and merge keys (`<<`).** serde_yaml
-  resolves anchors, but `extends` (cross-file/service inheritance) is not
-  supported.
-- **`version:` / obsolete top-level keys** should be accepted-and-ignored, not
-  cause a parse error — `deny_unknown_fields` is not set today, so verify
-  unknown keys stay non-fatal.
-- **Shutdown signal / grace period** is hardcoded `SIGTERM` + 10s
-  (`stop_and_cleanup_container`); should honor `stop_signal` /
-  `stop_grace_period`.
-- **UDP / range port readiness and cleanup** once ranges are supported.
-
 ## Beyond Docker Compose: orchestration features Compose doesn't cover
 
 Things this orchestrator could own that `docker compose` itself does not do.
-These are product ideas, not compose-spec gaps.
+These are product ideas, not compose-spec gaps. They build on top of the
+containers Compose creates: the Docker API (`bollard`) can inspect them and
+subscribe to their events, filtered on the `com.docker.compose.project=ninoverse`
+label, without `core` owning the compose parser.
 
 - **Desired-state reconciliation loop** (controller style): continuously drive
   actual container state toward the declared set, not just a one-shot boot —

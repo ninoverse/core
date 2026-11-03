@@ -1,5 +1,5 @@
+mod compose;
 mod db_handler;
-mod docker;
 mod error;
 mod kafka_handler;
 mod web_server;
@@ -20,10 +20,7 @@ use web_server::init_request_handler;
 
 use kafka_handler::init_kafka;
 
-use docker::{
-    create_docker_client, create_docker_networks, create_docker_volumes, find_docker_definitions,
-    start_docker_container,
-};
+use compose::start_compose_stack;
 
 use error::{CoreError, CoreResult};
 
@@ -96,18 +93,8 @@ async fn startup(
     join_set: &mut JoinSet<()>,
     shutdown_receiver: &mut broadcast::Receiver<()>,
 ) -> CoreResult<()> {
-    info!(["MAIN"], "Creating docker client");
-    let docker = create_docker_client().await?;
-    info!(["MAIN"], "Searching docker containers definitions");
-    let docker_definitions = find_docker_definitions().await?;
-    info!(["MAIN"], "Creating docker network");
-    create_docker_networks(docker_definitions.networks, &docker).await?;
-    info!(["MAIN"], "Creating docker volumes");
-    create_docker_volumes(docker_definitions.volumes, &docker).await?;
-    info!(["MAIN"], "Starting docker containers");
-    start_docker_container(
-        docker_definitions.services,
-        &docker,
+    info!(["MAIN"], "Starting compose stack");
+    start_compose_stack(
         shutdown_broadcast_sender,
         join_set,
         app_configuration.docker.remove_containers_on_shutdown,
