@@ -76,6 +76,8 @@ Checked by running `docker compose config` over that branch's
   This is what let a broken Kafka broker pass startup and surface 60s later as a
   client timeout. Fix it in the compose files: give every long-running service
   that others depend on a `healthcheck`, and use `condition: service_healthy`.
+  For services without one, the Docker events watcher proposed under "Beyond
+  Docker Compose" below can catch the crash after `up` returns.
 - **`remove_volumes_on_shutdown` and `remove_networks_on_shutdown`** are fields of
   `DockerConfiguration` (`crates/configuration`) that nothing reads, before or
   after this change. `down --volumes` would honor the first. The second cannot
@@ -138,6 +140,32 @@ containers Compose creates: the Docker API (`bollard`) can inspect them and
 subscribe to their events, filtered on the `com.docker.compose.project=ninoverse`
 label, without `core` owning the compose parser.
 
+- **Docker events watcher, with an optional startup check.** *Proposal.* The
+  daemon's event stream reports what `up --wait` cannot see. Verified: a service
+  that exits 3 every second under `restart: unless-stopped` passed `up --wait`
+  with exit 0, while the stream showed a `die` (`exitCode=3`) and a `start` for
+  every crash. Every event carries the container name and the Compose labels, so
+  it can be traced to its service.
+  - **Source.** `bollard`'s `Docker::events`, filtered by the daemon on
+    `label=com.docker.compose.project=ninoverse`, `type=container` and
+    `event=die|oom|health_status`. Without the `event` filter, each
+    healthcheck run adds three `exec_*` events. `docker compose events --json`
+    gives the same data but cannot filter, so `core` would have to parse it all.
+  - **Runtime.** Start the watcher before `up`, so crashes during startup are
+    seen too, and keep it in the shutdown `JoinSet`. It only logs: a `die` with
+    its exit code, an `oom`, and a `health_status: unhealthy`, each with its
+    service. Recovery stays with the restart policy.
+  - **Startup check.** An optional settle window, e.g.
+    `docker.startup_settle_seconds` (not implemented; default `0` = off): after
+    `up --wait` returns, a non-zero `die` or an `oom` from a long-running
+    service within the window fails startup like a failed `up`. One-shot
+    services that already finished (exit 0) are not affected.
+  - **Limit.** Events show that a container crashed, never that it is ready: a
+    service that crashes after the window passes the check. The window is a
+    time guess, not a readiness signal, so healthchecks stay the real gate. The
+    watcher only catches the cases they miss.
+  - **Foundation for the items below.** Crash-loop alerting, health-driven
+    backoff and orchestrator metrics all consume this same stream.
 - **Desired-state reconciliation loop** (controller style): continuously drive
   actual container state toward the declared set, not just a one-shot boot —
   re-create drifted/removed containers, converge on config changes.
