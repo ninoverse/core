@@ -88,6 +88,77 @@ Checked by running `docker compose config` over that branch's
   their fields. The old loader created duplicates instead. Neither reports it.
   `find_compose_files` sorts by name, so the merge order is stable.
 
+## Updating the stack without killing it
+
+Symbols named in this section are in `crates/core/src/compose.rs` unless
+stated otherwise. The Compose behaviour below was checked against Docker 29.9
+and Compose v5.6 with throwaway stacks.
+
+- **Restarting `core` stops every container.** Every shutdown ends in
+  `docker compose down`, or `stop` when `remove_containers_on_shutdown` is
+  false (`teardown_subcommand`). Both stop everything, so deploying a new `core`
+  binary takes the whole stack down with it. Add a third mode that leaves the
+  stack running, make it the normal setting for a long-lived deployment, and
+  move teardown to an explicit command. This is safe:
+  - the restart policies keep containers alive without `core`;
+  - re-running `up --wait` on a running, unchanged stack touches nothing (every
+    container kept its ID and uptime, and Compose reported them `Running`).
+
+  One option is to replace the boolean with an enum such as
+  `docker.on_shutdown: leave | stop | down`. That could also absorb the unused
+  `remove_volumes_on_shutdown` / `remove_networks_on_shutdown` fields (see
+  "Open" above).
+- **Service updates recreate only what changed.** Run `docker compose pull
+  <service>` first, so the download is not part of the downtime, then
+  `up -d --wait`. Changing one service's `command` recreated that service and
+  left the others alone; its downtime is one container stop plus start.
+  Dependents declared with `depends_on: { <dep>: { restart: true } }` are
+  restarted when the dependency is recreated (same container, uptime reset).
+  Without `restart: true` they stay up and must reconnect on their own. Decide
+  per dependency which one each service needs.
+- **Changes to mounted config files are invisible to Compose.** Editing a file
+  bind-mounted from `containers/config/` recreated nothing, and the running
+  process kept its old config. Each one needs an explicit reload or restart:
+  - HAProxy reloads gracefully on `docker compose kill -s HUP haproxy`: the same
+    container, the old worker drains and exits 0.
+  - APISIX applies routes changed through the admin API live (another reason
+    to provision through it). A change to its `config.yaml` needs a restart.
+  - Anything else: `docker compose restart <service>`.
+
+  Untested idea for `core`: before `up`, hash each bind-mounted config file and
+  pass the hash into a label through `${…}` interpolation. Compose recreates a
+  container when its labels change, so only the services whose config changed
+  would be recreated.
+- **A single-file bind mount does not see a replaced file.** With the wip
+  branch's `./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro`,
+  `sed -i` on the host left the container reading the old content even after a
+  reload, because the mount is pinned to the original file and `sed -i` writes a
+  new one. Anything that saves by writing a new file and renaming it over the
+  old one does the same. Mounting the directory instead
+  (`./config/haproxy/:/usr/local/etc/haproxy/:ro`) picked up the change on the
+  next HUP. Every config mount on the wip branch is a single-file mount
+  (`apisix.yaml`, `haproxy.cfg`, `kanidm/server.toml`, `vector.yaml`,
+  `tempo.yaml`, `mimir.yaml`). Move each file into its own directory, as
+  `config/kanidm/` already is, and mount the directory.
+- **Zero downtime needs two instances.** Recreating always leaves a gap. For a
+  stateless service behind APISIX:
+  1. start the new version beside the old one;
+  2. wait for its healthcheck;
+  3. switch the APISIX upstream through the admin API (`AdminClient` in
+     `crates/apisix`);
+  4. stop the old one.
+
+  `container_name` prevents two copies of a service from running, so those
+  services have to drop it. This is the mechanism behind "Dependency-aware
+  rolling restarts" under "Beyond Docker Compose".
+- **Stateful single instances have no zero-downtime path.** Postgres, kanidm
+  and etcd run as one instance each. Take a backup first (see "Postgres-aware
+  backups") and accept a short window. A Postgres **major** version bump is not
+  an image swap: the data directory is incompatible, so it needs `pg_upgrade`
+  or a dump and restore. The wip branch runs `postgres:19beta3-trixie`, and
+  Postgres betas can change the on-disk format between releases, so moving to
+  the final 19 release may need a dump and restore as well.
+
 ## Resource path resolution: switch to `current_exe()` for deployed binaries
 
 `config/default.yml` and `containers/` are currently anchored with
