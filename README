@@ -1,22 +1,22 @@
 # ninoverse `core`
 
-Rust orchestrator for the `ninoverse` home infrastructure: on startup it reads
-compose-style YAML definitions, stands up the required Docker networks,
-volumes and containers, and initializes a Postgres pool with migrations.
+Rust orchestrator for the `ninoverse` home infrastructure: on startup it brings
+up the Docker Compose stack in `containers/` through `docker compose`, and
+initializes a Postgres pool with migrations.
 Kafka and HTTP layers exist in the codebase but are not yet wired into the
 running binary (see [Status](#status)).
 
 ## What it does
 
 1. Loads configuration (`config/default.yml` + `APP__*` env overrides).
-2. Connects to the Docker daemon and parses every `containers/*.yaml` file.
-3. Creates the declared networks and volumes, then pulls images and starts
-   the declared containers, tracking them in a `JoinSet` for graceful
-   shutdown on `Ctrl+C`.
-4. Connects to Postgres with retry/backoff and runs the SQL migrations in
+2. Runs `docker compose up --detach --wait` over every `containers/*.yaml`
+   file as one project named `ninoverse`, and waits until Compose reports the
+   services running, healthy, or (for one-shot services) completed.
+3. Connects to Postgres with retry/backoff and runs the SQL migrations in
    `sql/`.
-5. Waits for `Ctrl+C`, then broadcasts shutdown and stops the containers it
-   started (per `docker.remove_containers_on_shutdown` in config).
+4. Waits for `Ctrl+C`, then broadcasts shutdown and runs `docker compose down`
+   (or `docker compose stop` when `docker.remove_containers_on_shutdown` is
+   false in config).
 
 ## Status
 
@@ -36,14 +36,14 @@ Cargo workspace, single member today:
 | `Cargo.toml` | Workspace root. `members = ["crates/*"]`, shared `[workspace.package]`. |
 | `crates/core/` | The `core` binary crate (`ninoverse`'s orchestrator). |
 | `crates/core/src/configuration/` | `config`-crate based settings loader (YAML + env). |
-| `crates/core/src/docker/` | Parses `containers/*.yaml`, drives `bollard` to create networks/volumes/containers. |
+| `crates/core/src/compose.rs` | Runs `docker compose up`/`down` over `containers/*.yaml`. |
 | `crates/core/src/db_handler/` | Postgres pool (`sqlx`) + migration runner. |
 | `crates/core/src/kafka_handler/` | `rdkafka` producer/consumer/admin helpers (not yet started from `main`). |
 | `crates/core/src/web_server/` | `actix-web` HTTP API (not yet started from `main`). |
 | `crates/core/src/http_handler/` | Standalone request/response (de)serializer, currently unused. |
 | `crates/core/src/logger/` | Custom async logger (`info!`/`warn!`/`error!`/`debug!` macros over an mpsc channel). |
 | `crates/core/config/` | `default.yml` plus config for the local infra stack (`haproxy.cfg`, `tempo.yaml`, `vector.yaml`). |
-| `crates/core/containers/` | One compose-style YAML per service/group; parsed at startup. |
+| `crates/core/containers/` | One Docker Compose file per service/group, merged into one project at startup. |
 | `crates/core/sql/` | Numbered migrations run against the `database.name` in config. |
 | `bin/` | `Dockerfile` + `build.sh` for packaging the binary as a container image. |
 | `sonarqube/` | Self-hosted SonarQube `Dockerfile` + `scan.sh` (see [Code quality](#code-quality)). |
@@ -82,8 +82,8 @@ Cargo workspace, single member today:
 
 Prerequisites:
 
-- A reachable Docker daemon (`docker` socket) — `core` creates and starts
-  containers on startup.
+- A reachable Docker daemon and Docker Compose v2 (the `docker compose`
+  plugin) — `core` runs `docker compose up` on startup.
 - The pinned Rust toolchain (`rust-toolchain.toml` pulls it automatically on
   first `cargo` invocation).
 
@@ -92,9 +92,8 @@ cd crates/core
 cargo run                    # loads config/default.yml relative to this dir
 ```
 
-`Ctrl+C` triggers a graceful shutdown: the broadcast channel fires, spawned
-container-supervisor tasks are joined, and (per config) started containers
-are removed.
+`Ctrl+C` triggers a graceful shutdown: the broadcast channel fires and the
+compose stack is brought down (or only stopped, per config).
 
 ## Daily commands
 

@@ -1,7 +1,7 @@
 # TODO
 
-> **Where the compose definitions live.** `main` carries the loader but no
-> compose files — `crates/core/containers/` holds only a `.gitkeep`, and
+> **Where the compose definitions live.** `main` carries the compose runner but
+> no compose files — `crates/core/containers/` holds only a `.gitkeep`, and
 > `crates/core/config/default.yml` is absent, so a `cargo run` of the `core`
 > binary on `main` fails at configuration load. The actual stack (`haproxy`,
 > `core.yaml`, the `observability_*` files, the vendored `containers/config/`
@@ -9,16 +9,286 @@
 > `wip/add-docker-definitions-and-configurations` branch. Items below that
 > speak of services "in the stack" mean that branch.
 
+## Decision: k3s for almost everything, Compose for the front door
+
+Most services, and every application the owner writes, run in **k3s,
+installed on the host** under systemd. A small **Compose layer** run by `core`
+keeps what has to work while the cluster is down. The test for what stays out
+of the cluster: *with k3s down, can you still get in, see what is wrong, and
+restore it?* Anything needed for one of those three, or for k3s to start, stays
+in Compose.
+
+`core` does not grow Kubernetes-like features of its own. k3s already provides
+them: Deployments, probes, rollouts and rollback, CronJobs, Secrets,
+operators.
+
+### What stays out of the cluster
+
+| Service | Why it stays out |
+|---|---|
+| `core` | It bootstraps the Compose layer and provisions both layers, so it cannot depend on the cluster. |
+| HAProxy | Owns 80/443 and TLS termination. In the cluster, a k3s outage would make everything unreachable, including the tools to fix it. Certificate renewal goes through it too. |
+| kanidm | The root of trust: the k3s API server, Headlamp and every APISIX gate validate its tokens. In the cluster, a broken k3s would take every sign-in with it. |
+| Platform Postgres | `core` connects to it at startup, and its `databases` table is platform state. |
+| Secrets (`secrets/`, `containers/.env`) | Generated on the host by `core`, read by both layers. |
+| A minimal log path: Vector, one log store, Grafana | Monitoring inside the cluster is down exactly when the cluster is the problem. |
+| Backup target | Backups of the cluster cannot live in it. Off-site is better still; SFTP is at most a staging area. |
+
+Kept out by preference, though they could move:
+
+- **APISIX and its etcd.** They gate services that stay out (the `nora` UI, for
+  example), which would go down with the cluster. Treat them as part of the
+  front door with HAProxy and kanidm. Public traffic for applications goes
+  HAProxy → APISIX → application, so kanidm gating stays in one place.
+- **`nora` registry.** In the cluster, rebuilding a node means pulling
+  application images from a registry that is not running yet. That is workable
+  (`nora`'s own image is public), but out is simpler.
+- **Redpanda/Kafka.** `run_threads` starts `core`'s Kafka task once startup is
+  done. Move the broker in only if applications are its only users; otherwise
+  `core`'s run phase depends on the cluster.
+
+### What moves in
+
+- **Headlamp.** It is the cluster's UI. In-cluster it can use `-in-cluster`
+  mode, where its `HEADLAMP_CONFIG_OIDC_*` settings are honored
+  (`docs/headlamp.md` on the wip branch), which should retire the hand-built
+  kubeconfig.
+- **The evaluation backends:** Loki, Tempo, Mimir, OpenObserve, VictoriaLogs.
+  Keep only the minimal log path above in Compose.
+- **SonarQube.**
+- **SigNoz.** Upstream no longer ships Compose files but does publish a Helm
+  chart, so the porting problem in `docs/signoz.md` goes away.
+- **Application databases**, through the CloudNativePG operator, which handles
+  backups and major-version upgrades for them. The platform Postgres stays out
+  and still needs "Postgres-aware backups".
+- **The owner's applications.**
+
+### Scope changes for other sections
+
+- **"Beyond Docker Compose" and "Updating the stack without killing it"** apply
+  to the Compose layer only, which is small and changes rarely. Everything in
+  the cluster gets rollouts, probes and rollback from Kubernetes.
+- **"Unified service declaration"** covers the Compose layer completely. For
+  workloads in the cluster it covers only what the front door owes them:
+  kanidm client, APISIX route, host, certificate, DNS and database. The
+  workload itself is Kubernetes manifests or Helm.
+
+### Work this implies
+
+Items marked *unverified* could not be tested here: k3s 1.36 refuses to start
+on a cgroup v1 host, which is what this was checked on.
+
+- **Install k3s on the host and retire the Docker-hosted one.** That removes
+  `containers/standalone/k3s.yaml` and `bin/start_k3s.sh` on the wip branch.
+  On the host, k3s's lifecycle is independent of `core`. A `core` restart or a
+  Compose update can no longer bounce the cluster. The cluster's volumes live on
+  the host rather than inside a privileged container's volume.
+- **Use k3s's own datastore.** The wip branch points k3s at APISIX's etcd
+  (`K3S_DATASTORE_ENDPOINT=http://etcd:2379`), so a problem in one reaches the
+  other. Single-node k3s defaults to embedded SQLite.
+- **Stop committing the cluster token.** `K3S_TOKEN=my-super-secret-token` is
+  in `k3s.yaml`. A host install generates its own token; leave it there.
+- **Keep a break-glass login.** k3s's certificate-based admin kubeconfig does
+  not depend on kanidm. Keep a copy somewhere that survives the host, for when
+  identity or the front door is broken.
+- **Pods reaching the Compose layer.** *Unverified.* Compose service names
+  (`postgres`, `kanidmd`) resolve only inside Docker's networks, not from the
+  host, so they will not resolve from pods either.
+  - Publish the ports pods need on an address pods can reach. HAProxy's
+    `127.0.0.1:5432` is loopback-only and is not one.
+  - Give them in-cluster names with selector-less Services plus Endpoints, or
+    `ExternalName`.
+- **The front door reaching the cluster.** *Unverified.* APISIX runs in Docker
+  and has to reach application Services on the host: a NodePort through
+  Docker's host gateway (`extra_hosts: host.docker.internal:host-gateway`).
+  Disable k3s's bundled Traefik (`--disable traefik`) so APISIX is the only
+  gateway. Each application then gets a `Service` entry in
+  `ServicesConfiguration` whose upstream is that NodePort.
+- **Pulling images from `nora`.** `nora` sets
+  `NORA_AUTH_DOCKER_ANON_PULL=false`, so k3s needs
+  `/etc/rancher/k3s/registries.yaml` with credentials. It also needs a path to
+  `nora` that does not go through a browser sign-in at APISIX.
+- **Credentials for workloads.** Databases and secrets that `core` provisions
+  for a workload in the cluster go in as Kubernetes Secrets through the API,
+  not as files in `secrets/`.
+- **Logs from the cluster.** Pod logs are written under `/var/log/pods` on the
+  host, and Docker does not see them. Either bind-mount that directory into the
+  Compose Vector, or run a log agent in the cluster that forwards to it.
+  *Unverified:* the path for this k3s version.
+- **Moving data.** Each service that moves in brings its named volume with it.
+  Copy each volume into a persistent volume (k3s's local-path provisioner keeps
+  them on the host), or restore from a backup taken just before the move.
+- **Deploy flow** (build → push to `nora` → apply). Not decided: `kubectl` or
+  Helm from CI, or GitOps with Flux or Argo CD.
+
+## Compose runner
+
+Symbols named in this section are in `crates/core/src/compose.rs` unless
+stated otherwise.
+
+`core` no longer parses compose files itself. `start_compose_stack` hands every
+`*.yaml` / `*.yml` directly inside `containers/` (found by
+`find_compose_files`, sorted, not recursive) to `docker compose up --detach
+--wait` as one project named `PROJECT_NAME` (`ninoverse`), and registers a task
+that runs `docker compose down` — or `stop`, when
+`docker.remove_containers_on_shutdown` is false — once shutdown is broadcast.
+Compose's own output goes straight to the terminal, not through `logger`.
+Docker Compose v2 (the `docker compose` plugin) is a runtime prerequisite.
+
+### Why the hand-rolled loader was dropped
+
+The previous `src/docker.rs` (~2,300 lines) parsed compose files into its own
+`ServiceConfig` and drove `bollard` directly. It covered twelve compose keys and
+silently ignored the rest, so a valid compose file meant something different
+here than under `docker compose`. That cost real bugs: a malformed `command`
+quote ran the image's default command, the `environment` map form failed to
+parse, `entrypoint` was ignored, `container_name` was discarded, and
+`healthcheck` was never parsed — so `condition: service_healthy` degraded to
+"running". The remaining gap list (`build:`, full `ports` syntax, `labels`,
+`deploy`, resource limits, `logging`, security options, network/volume long
+forms, `secrets`/`configs`, `profiles`, `platform`, `pull_policy`, `extends`,
+`stop_signal`/`stop_grace_period`, …) was the whole rest of the spec. Compose
+already implements all of it, and nothing the module added on top was
+something Compose lacks. The orchestration ideas that do go beyond Compose
+(below) only need the Docker API, not ownership of the parser.
+
+### Before merging the wip branch
+
+Checked by running `docker compose config` over that branch's
+`containers/*.yaml`. Everything else merges and validates as one project.
+
+- **Two files make Compose reject the whole project.** `sonarqube.yaml` is
+  commented out entirely (`empty compose file`) and `observability_generator.yaml`
+  keeps a bare `services:` with every entry commented out (`services must be a
+  mapping`). Delete them, move them out of `containers/`, or rename them to a
+  non-`.yaml` extension.
+- **Named volumes change name.** Compose prefixes them with the project name, so
+  `etcd-data` becomes `ninoverse_etcd-data`, and so on. Volumes created by the old
+  loader hold existing data (Postgres, kanidm, Grafana, …) and will **not** be
+  reused. Either set `name: <old-name>` on each top-level volume to keep
+  using them, or copy the data across once.
+- **Networks change name too.** `ninoverse-network` becomes
+  `ninoverse_ninoverse-network`. Service-name DNS is unaffected; set
+  `name: ninoverse-network` if anything outside the project refers to it by
+  name. `etcd-backend`'s `internal: true`, ignored by the old loader, is now
+  honored.
+- **The renamed networks break the standalone k3s stack.**
+  `containers/standalone/k3s.yaml` joins `etcd-backend` and `ninoverse-network`
+  as `external: true`, which Compose looks up by their literal names. With the
+  main stack now creating `ninoverse_etcd-backend`, `bin/start_k3s.sh` fails
+  with `network etcd-backend declared as external, but could not be found`
+  (reproduced with a throwaway stack). The decision at the top of this file
+  retires the Docker-hosted k3s in favour of a host install. Until that
+  happens, set `name:` on both networks in the main stack to keep
+  `bin/start_k3s.sh` working.
+- **APISIX admin key.** `containers/api_gateway.yaml` still hardcodes `ADMIN_KEY`.
+  `init_kanidm_apisix` reads the key from `secrets/APISIX_ADMIN_KEY`
+  (`SecretStore::apisix_admin_key` in `init_kanidm_apisix/src/secrets.rs`).
+  Switch the compose file to `${APISIX_ADMIN_KEY:?…}` with the value in
+  `containers/.env` to retire the by-hand sync. Use the `:?` form: Compose
+  substitutes an empty string for a plain `${VAR}` that is unset, where the old
+  loader failed.
+
+### Open
+
+- **A crash-looping container without a healthcheck passes `--wait`.** Verified:
+  a service that exits non-zero under `restart: unless-stopped` is reported
+  healthy and `up` exits 0. With a `healthcheck`, `up --wait` fails as it should.
+  This is what let a broken Kafka broker pass startup and surface 60s later as a
+  client timeout. Fix it in the compose files: give every long-running service
+  that others depend on a `healthcheck`, and use `condition: service_healthy`.
+  For services without one, the Docker events watcher proposed under "Beyond
+  Docker Compose" below can catch the crash after `up` returns.
+- **`remove_volumes_on_shutdown` and `remove_networks_on_shutdown`** are fields of
+  `DockerConfiguration` (`crates/configuration`) that nothing reads, before or
+  after this change. `down --volumes` would honor the first. The second cannot
+  be honored as `false` with `down`, which always removes the project's
+  networks. Either wire them or remove them.
+- **A service key repeated across files is merged, not reported.** Compose treats
+  later `--file`s as overrides, so two files declaring the same service combine
+  their fields. The old loader created duplicates instead. Neither reports it.
+  `find_compose_files` sorts by name, so the merge order is stable.
+
+## Updating the stack without killing it
+
+Symbols named in this section are in `crates/core/src/compose.rs` unless
+stated otherwise. The Compose behaviour below was checked against Docker 29.9
+and Compose v5.6 with throwaway stacks.
+
+- **Restarting `core` stops every container.** Every shutdown ends in
+  `docker compose down`, or `stop` when `remove_containers_on_shutdown` is
+  false (`teardown_subcommand`). Both stop everything, so deploying a new `core`
+  binary takes the whole stack down with it. Add a third mode that leaves the
+  stack running, make it the normal setting for a long-lived deployment, and
+  move teardown to an explicit command. This is safe:
+  - the restart policies keep containers alive without `core`;
+  - re-running `up --wait` on a running, unchanged stack touches nothing (every
+    container kept its ID and uptime, and Compose reported them `Running`).
+
+  One option is to replace the boolean with an enum such as
+  `docker.on_shutdown: leave | stop | down`. That could also absorb the unused
+  `remove_volumes_on_shutdown` / `remove_networks_on_shutdown` fields (see
+  "Open" above).
+- **Service updates recreate only what changed.** Run `docker compose pull
+  <service>` first, so the download is not part of the downtime, then
+  `up -d --wait`. Changing one service's `command` recreated that service and
+  left the others alone; its downtime is one container stop plus start.
+  Dependents declared with `depends_on: { <dep>: { restart: true } }` are
+  restarted when the dependency is recreated (same container, uptime reset).
+  Without `restart: true` they stay up and must reconnect on their own. Decide
+  per dependency which one each service needs.
+- **Changes to mounted config files are invisible to Compose.** Editing a file
+  bind-mounted from `containers/config/` recreated nothing, and the running
+  process kept its old config. Each one needs an explicit reload or restart:
+  - HAProxy reloads gracefully on `docker compose kill -s HUP haproxy`: the same
+    container, the old worker drains and exits 0.
+  - APISIX applies routes changed through the admin API live (another reason
+    to provision through it). A change to its `config.yaml` needs a restart.
+  - Anything else: `docker compose restart <service>`.
+
+  Untested idea for `core`: before `up`, hash each bind-mounted config file and
+  pass the hash into a label through `${…}` interpolation. Compose recreates a
+  container when its labels change, so only the services whose config changed
+  would be recreated.
+- **A single-file bind mount does not see a replaced file.** With the wip
+  branch's `./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro`,
+  `sed -i` on the host left the container reading the old content even after a
+  reload, because the mount is pinned to the original file and `sed -i` writes a
+  new one. Anything that saves by writing a new file and renaming it over the
+  old one does the same. Mounting the directory instead
+  (`./config/haproxy/:/usr/local/etc/haproxy/:ro`) picked up the change on the
+  next HUP. Every config mount on the wip branch is a single-file mount
+  (`apisix.yaml`, `haproxy.cfg`, `kanidm/server.toml`, `vector.yaml`,
+  `tempo.yaml`, `mimir.yaml`). Move each file into its own directory, as
+  `config/kanidm/` already is, and mount the directory.
+- **Zero downtime needs two instances.** Recreating always leaves a gap. For a
+  stateless service behind APISIX:
+  1. start the new version beside the old one;
+  2. wait for its healthcheck;
+  3. switch the APISIX upstream through the admin API (`AdminClient` in
+     `crates/apisix`);
+  4. stop the old one.
+
+  `container_name` prevents two copies of a service from running, so those
+  services have to drop it. This is the mechanism behind "Dependency-aware
+  rolling restarts" under "Beyond Docker Compose".
+- **Stateful single instances have no zero-downtime path.** Postgres, kanidm
+  and etcd run as one instance each. Take a backup first (see "Postgres-aware
+  backups") and accept a short window. A Postgres **major** version bump is not
+  an image swap: the data directory is incompatible, so it needs `pg_upgrade`
+  or a dump and restore. The wip branch runs `postgres:19beta3-trixie`, and
+  Postgres betas can change the on-disk format between releases, so moving to
+  the final 19 release may need a dump and restore as well.
+
 ## Resource path resolution: switch to `current_exe()` for deployed binaries
 
-`config/default.yml`, `containers/*.yaml`, and bind-mount sources resolved in
-`resolve_host_path` are currently anchored with `env!("CARGO_MANIFEST_DIR")`
-(the `CONFIG` consts in `crates/core/src/main.rs` and
-`crates/init_kanidm_apisix/src/main.rs`, and `find_docker_definitions` in
-`crates/core/src/docker.rs`, whose compose dir is what `resolve_host_path`
-resolves relative sources against). This is a
-compile-time constant — it bakes the build machine's source checkout path
-(e.g. `/home/nino/repositories/core/crates/core`) directly into the binary.
+`config/default.yml` and `containers/` are currently anchored with
+`env!("CARGO_MANIFEST_DIR")` (the `CONFIG` consts in `crates/core/src/main.rs`
+and `crates/init_kanidm_apisix/src/main.rs`, and `COMPOSE_DIR` in
+`crates/core/src/compose.rs`, which is also the `--project-directory` relative
+bind-mount sources resolve against). This is a compile-time constant — it bakes
+the build machine's source checkout path (e.g.
+`/home/nino/repositories/core/crates/core`) directly into the binary.
 
 This is enough to make `cargo run`/`cargo test` behave the same regardless of
 invocation CWD, which was the immediate problem. It is **not** enough for a
@@ -43,8 +313,8 @@ fn resource_dir() -> std::path::PathBuf {
 }
 ```
 
-Then anchor `config/default`, `containers/`, and bind-mount sources on
-`resource_dir()` instead of `env!("CARGO_MANIFEST_DIR")`.
+Then anchor `config/default` and `containers/` on `resource_dir()` instead of
+`env!("CARGO_MANIFEST_DIR")`.
 
 **Precondition:** this only works if `config/` and `containers/` are
 physically placed next to the compiled binary at runtime, in *every* context
@@ -54,206 +324,40 @@ the binary runs in — plain `cargo run` puts the binary in `target/debug/` or
 co-locate them before this works locally too. Do this alongside whatever
 Docker packaging/deployment story gets built for this crate, not before.
 
-## Docker module: compose-file coverage
-
-Today the parser (`ServiceConfig`, `src/docker.rs`) understands only a
-narrow slice of the Compose spec: `image`, `ports`, `networks`, `volumes`,
-`environment`, `env_file`, `container_name`, `command`, `entrypoint`, `user`,
-`depends_on`, `restart`. Anything else in a real-world
-`docker-compose.yml` is silently ignored, or makes the parse/boot fail. The
-groups below track what's needed to boot an arbitrary compose file correctly.
-Symbols named below are in `src/docker.rs` unless stated otherwise; they are
-given as names rather than line numbers so the references survive edits.
-
-### Main functionalities
-
-The minimum needed to boot most real compose files correctly. Entries marked
-`[x]` are implemented; they are kept for the record rather than deleted.
-
-- [x] **`depends_on` + startup ordering.** Was: every service waited on one
-  shared `Barrier`, so there was no ordering. Now supports the list form and
-  the long form with `condition: service_started | service_healthy |
-  service_completed_successfully`, and boots in dependency order — `DependsOn`
-  / `DependencyCondition`, `wait_for_dependency`.
-- [x] **`restart` policy.** Was: a hardcoded 5s crash-restart loop. Now
-  resolved to the container's `RestartPolicy` (`no`, `always`,
-  `on-failure[:max]`, `unless-stopped`) by `resolve_restart_policy` and applied
-  to the `HostConfig` built in `boot_service`.
-- [x] **Malformed `command` quoting was swallowed.** Was: `shlex::split`
-  returns `None` on an unterminated quote or trailing backslash, and
-  `.unwrap_or_default()` turned that into an empty `Vec`. Docker treats an
-  empty `Cmd` as unset, so the container silently ran the **image's default
-  command** instead of the one declared. Now resolved at load time into
-  `ServiceConfig.command_argv` by `resolve_command`, so a bad quote aborts
-  startup with `DockerModuleError::InvalidCommand` before any container is
-  created.
-  Concrete failure it prevented: a busybox init service that runs
-  `sh -c "chown -R 8443:8443 /data"` to hand a volume to the uid its dependent
-  runs as, gated by `service_completed_successfully`. A typo in that quoting
-  made busybox run its default `sh`, which hits EOF and **exits 0** (verified),
-  satisfying the gate, so the dependent booted as that uid against an unchowned
-  volume. Verified alongside: `"User":""` leaves `Config.User` at the image's
-  value, so the `Some("")` `boot_service` still sends for `user` is harmless.
-- **Parse `healthcheck` + gate a service's own readiness on it.**
-  `wait_for_healthy` already consumes Docker health state for `depends_on:
-  condition: service_healthy`, but `healthcheck` is not a field on
-  `ServiceConfig` at all, so a container defined here never *has* a health
-  state to read — its no-healthcheck fallback degrades to "running". Parse
-  `healthcheck` (`test`, `interval`, `timeout`, `retries`, `start_period`,
-  `disable`) and pass it to `bollard`. Separately, a service's own boot gate
-  (the readiness loop in `boot_service`) still only checks `running`/terminal,
-  so a container that starts and immediately crash-loops under
-  `restart: unless-stopped` is reported as started. That is what let a broken
-  Kafka broker pass startup and surface 60s later as a client timeout.
-- [x] **`environment` map form.** Was: only the `- KEY=VALUE` list form was
-  accepted (`ServiceConfig.environment: Option<Vec<String>>`), so a file using
-  the mapping form failed to parse outright. Now both forms resolve into
-  `ServiceConfig.env` via `resolve_environment` — the `Environment` enum carries
-  `serde_yaml::Value` map values so `REPLICAS: 3` and `DEBUG: true` coerce to
-  strings rather than failing the parse, a bare `KEY` (list) or null `KEY:`
-  (map) inherits from the host and is dropped when unset, and a duplicated key
-  collapses to its last occurrence, matching what Docker does with `Env`.
-- [x] **`env_file`.** Was: not parsed at all, so a service keeping its variables
-  in a separate file silently got none of them. Now both the string and list
-  forms load via `resolve_environment`, resolved against the compose dir by
-  `resolve_host_path`, and merge under `environment` with Compose precedence —
-  files in the order listed, then inline `environment` on top. Line parsing
-  lives in `parse_env_file_content`; `export KEY=…` prefixes, multi-line values,
-  and interpolation inside env files are not supported.
-- [x] **Variable interpolation `${VAR}` / `${VAR:-default}`.** Was: absent
-  entirely, so `${VAR}` reached the container as a literal string.
-  `interpolate_variables` now substitutes into the file text before parsing, out
-  of `.env` in the compose directory overlaid by the host environment
-  (`load_interpolation_variables`, host wins). `$$` is a literal `$`.
-  Deliberately narrower than Compose in two places, trading a silent
-  misconfiguration for a loud one: an unset variable with no default is a
-  `DockerModuleError::UnsetVariable` rather than Compose's warn-and-substitute-
-  empty, and an unbraced `$VAR` is rejected rather than passed through.
-  `${VAR:?message}` is supported and reports the author's own message
-  (`RequiredVariable`) — `containers/standalone/redpanda.yaml` already uses it.
-  `${VAR-default}` (no colon) is not implemented and is reported as malformed
-  rather than read as a variable name.
-  The motivating case — the APISIX admin key — is **not yet closed end to end.**
-  `init_kanidm_apisix` reads the key from `secrets/APISIX_ADMIN_KEY`
-  (`SecretStore::apisix_admin_key` in `init_kanidm_apisix/src/secrets.rs`) to
-  sign its admin calls, while APISIX resolves it from its own container
-  environment. The mechanism to let both read one source now exists, but the
-  compose definition that has to adopt it — `containers/api_gateway.yaml`, whose
-  `ADMIN_KEY` is still a hardcoded placeholder — lives on the unmerged
-  `wip/add-docker-definitions-and-configurations` branch. Switching it to
-  `${APISIX_ADMIN_KEY}` is what actually retires the by-hand sync.
-- **`build:`.** Support building an image from a `context` (+ `dockerfile`,
-  `args`, `target`) when `image:` is absent. Currently only the `create_image`
-  (pull) path in `boot_service` is implemented.
-- [x] **`entrypoint`.** Was: not parsed at all, so a service overriding the
-  image's `ENTRYPOINT` was silently ignored and the image's own entry point ran
-  instead. Now resolved at load time into `ServiceConfig.entrypoint_argv` by
-  `resolve_entrypoint` and passed to `ContainerCreateBody.entrypoint` in
-  `boot_service`. An absent `entrypoint:` stays `None`, which is skipped during
-  serialization so Docker inherits the image's; an explicit `entrypoint: ""` or
-  `entrypoint: []` resolves to an empty argv, which Docker reads as *clear the
-  image's entry point*. That is deliberately not symmetric with `command:` — an
-  empty `Cmd` means unset, so the image's default command still runs.
-- [x] **`command` / `entrypoint` list form.** Was: only the string (shell) form
-  was parsed (`ServiceConfig.command: Option<String>`), so a YAML sequence
-  failed deserialization of the *entire compose file* and aborted startup rather
-  than the one service. Both keys now take a `CommandSpec`, an untagged enum
-  over the two shapes, resolved by `resolve_argv`: the string form is a shell
-  line split by `shlex::split`, the list form is already argv and is taken
-  verbatim. Re-splitting the list form is the bug this prevents — it would break
-  every element holding a space, and hand `&&` to the image's entry point as a
-  literal argument instead of to a shell.
-- **Use `container_name`.** It is parsed but discarded (`_container_name`,
-  in `boot_service`); containers are always named after the service key, via
-  `CreateContainerOptions.name`. Because the service key is also the DNS name
-  on the network, a file whose `container_name` differs from its service key
-  silently breaks every hostname that refers to it — including the container's
-  own env vars. Honor it when present, fall back to the service key otherwise.
-- **Full `ports` short syntax.** Handle `container`-only, `/udp` protocol, and
-  port ranges (`8000-8010:8000-8010`). `host:container` and `ip:host:container`
-  both work today (the `ports` loop in `boot_service`).
-- **`ports` long syntax.** `target` / `published` / `protocol` / `mode`
-  mapping form.
-- **Top-level `name:` (project namespace).** Compose prefixes resources with a
-  project name. The `raw_name.to_string()` / `net.to_string()` calls in
-  `find_docker_definitions` copy the name through unchanged — decide on and
-  apply a real naming/namespacing scheme.
-
-### Nice to have
-
-Common but not required for a basic boot.
-
-- **`labels`** (map and list form) on services, networks, volumes.
-- **`expose`** (documented container ports without host publishing).
-- **`deploy` block:** `resources.limits/reservations` (cpus/memory),
-  `replicas`, `restart_policy`.
-- **Resource limits (v2 style):** `mem_limit`, `mem_reservation`, `cpus`,
-  `cpu_shares`, `pids_limit`, `shm_size`.
-- **`logging`** driver + options → `HostConfig.log_config`.
-- **`working_dir`, `hostname`, `domainname`, `stop_signal`,
-  `stop_grace_period`.**
-- **`extra_hosts`** → `HostConfig.extra_hosts`.
-- **`dns`, `dns_search`.**
-- **`cap_add` / `cap_drop`, `privileged`, `security_opt`, `devices`,
-  `sysctls`, `ulimits`, `read_only`, `init`, `tmpfs`.**
-- **`network_mode`, `pid`, `ipc`, `userns_mode`.**
-- **Network long form per service:** `aliases`, `ipv4_address`, `ipv6_address`
-  (currently only a plain name list, built in `boot_service`). `aliases` would
-  also give `container_name` a natural implementation.
-- **Network top-level options:** `external`, `internal`, `attachable`, `ipam`,
-  `enable_ipv6`, `labels`, `driver_opts` (only `driver` is read on
-  `NetworkConfig`).
-- **Volume top-level options:** `external`, `driver_opts`, `labels`, `name`
-  (only `driver` is read on `VolumeConfig`).
-- **Volume/mount long-syntax sub-options:** `volume.nocopy`,
-  `bind.propagation` / `create_host_path`, `tmpfs.size` / `tmpfs.mode`
-  (`resolve_long_volume` ignores these).
-- **Top-level `secrets` and `configs`** (+ per-service references, file/env
-  sources).
-- **`profiles`** (only start services whose profile is active).
-- **`platform`** per service (currently always `String::new()` in the
-  `CreateContainerOptions` built by `boot_service`).
-- **`pull_policy`** (`always` / `missing` / `never` / `build`) instead of the
-  current always-pull-when-untagged behavior (`resolve_pull_tag`).
-
-### Edge cases
-
-Correctness / robustness gaps that bite on specific files. Entries marked `[x]`
-are implemented; they are kept for the record rather than deleted.
-
-- [x] **Multi-service dependency cycles** in `depends_on` — detected and
-  reported via `validate_dependency_graph` and the
-  `DockerModuleError::DependencyCycle` variant.
-- [x] **`inspect_container(...).unwrap()`** in the readiness loop — no longer
-  panics if the container exits/vanishes during startup; the `Err` propagates
-  with `?` (the readiness loop in `boot_service`).
-- [x] **`panic!` on create/start failure** — all three sites now propagate as
-  `DockerModuleError` and let the caller decide; no `panic!` or `unwrap()`
-  remains outside the test module.
-- **Duplicate resource names across files.** Services/networks/volumes from all
-  `containers/*.yaml` are pushed into flat `Vec`s by `find_docker_definitions`;
-  collisions silently duplicate. Detect and error (or last-wins with a warning).
-- **Ambiguous bind vs. named-volume sources.** `~` / relative binds are handled
-  (`resolve_host_path`), but Windows-style paths and sources that are ambiguous
-  between a named volume and a host path (`is_host_path`) need review.
-- **Empty / partial compose files** (`services:` absent, `null` service body)
-  and non-map YAML — the current parse assumes well-formed structure.
-- **YAML `extends`, anchors/aliases, and merge keys (`<<`).** serde_yaml
-  resolves anchors, but `extends` (cross-file/service inheritance) is not
-  supported.
-- **`version:` / obsolete top-level keys** should be accepted-and-ignored, not
-  cause a parse error — `deny_unknown_fields` is not set today, so verify
-  unknown keys stay non-fatal.
-- **Shutdown signal / grace period** is hardcoded `SIGTERM` + 10s
-  (`stop_and_cleanup_container`); should honor `stop_signal` /
-  `stop_grace_period`.
-- **UDP / range port readiness and cleanup** once ranges are supported.
-
 ## Beyond Docker Compose: orchestration features Compose doesn't cover
 
 Things this orchestrator could own that `docker compose` itself does not do.
-These are product ideas, not compose-spec gaps.
+These are product ideas, not compose-spec gaps. They build on top of the
+containers Compose creates: the Docker API (`bollard`) can inspect them and
+subscribe to their events, filtered on the `com.docker.compose.project=ninoverse`
+label, without `core` owning the compose parser.
 
+- **Docker events watcher, with an optional startup check.** *Proposal.* The
+  daemon's event stream reports what `up --wait` cannot see. Verified: a service
+  that exits 3 every second under `restart: unless-stopped` passed `up --wait`
+  with exit 0, while the stream showed a `die` (`exitCode=3`) and a `start` for
+  every crash. Every event carries the container name and the Compose labels, so
+  it can be traced to its service.
+  - **Source.** `bollard`'s `Docker::events`, filtered by the daemon on
+    `label=com.docker.compose.project=ninoverse`, `type=container` and
+    `event=die|oom|health_status`. Without the `event` filter, each
+    healthcheck run adds three `exec_*` events. `docker compose events --json`
+    gives the same data but cannot filter, so `core` would have to parse it all.
+  - **Runtime.** Start the watcher before `up`, so crashes during startup are
+    seen too, and keep it in the shutdown `JoinSet`. It only logs: a `die` with
+    its exit code, an `oom`, and a `health_status: unhealthy`, each with its
+    service. Recovery stays with the restart policy.
+  - **Startup check.** An optional settle window, e.g.
+    `docker.startup_settle_seconds` (not implemented; default `0` = off): after
+    `up --wait` returns, a non-zero `die` or an `oom` from a long-running
+    service within the window fails startup like a failed `up`. One-shot
+    services that already finished (exit 0) are not affected.
+  - **Limit.** Events show that a container crashed, never that it is ready: a
+    service that crashes after the window passes the check. The window is a
+    time guess, not a readiness signal, so healthchecks stay the real gate. The
+    watcher only catches the cases they miss.
+  - **Foundation for the items below.** Crash-loop alerting, health-driven
+    backoff and orchestrator metrics all consume this same stream.
 - **Desired-state reconciliation loop** (controller style): continuously drive
   actual container state toward the declared set, not just a one-shot boot —
   re-create drifted/removed containers, converge on config changes.
@@ -276,6 +380,97 @@ These are product ideas, not compose-spec gaps.
 - **Readiness probes richer than Docker healthchecks** (e.g. TCP/HTTP probe a
   service, with dependency-condition timeouts, before marking deps ready).
 - **Rollback on failed deploy** (keep last-known-good, revert on boot failure).
+
+## Beyond containers: platform ideas
+
+*Proposals, none implemented.* Each item notes what it builds on in the
+current tree. Unless stated otherwise, `ServicesConfiguration`, `Service`,
+`Person` and `ServiceProtectionMode` are in `crates/configuration`, and the
+`run_*_stage` functions are in `crates/init_kanidm_apisix/src/lib.rs`.
+
+### One declaration per service
+
+- **Unified service declaration.** Adding a service today means hand-editing
+  five or six places: its compose file, a Vector sink, an HAProxy host ACL, the
+  certificate SAN list, its `Service` entry (kanidm client and APISIX route), and
+  often SQL migrations for its database (`05`–`07` exist only for SonarQube).
+  `docs/signoz.md` §3 walks through each one. Instead, `core` would drive all
+  of them from a single entry per service: host, upstream, protection mode,
+  whether it needs a database, and whether it emits telemetry. `Service` and
+  `ServiceProtectionMode` already cover the identity and gateway half. Most
+  items below get simpler once this exists, so it comes first.
+
+### Platform services `core` could own
+
+- **Create a database per service.** `sql/02_create_databases_table.sql`
+  creates a `databases` table with a `status` column, but only seed migrations
+  write to it. `core` would create the database and role for each declared
+  service that needs one, generate the password into `secrets/`, and record
+  the result in that table. That replaces hand-written per-service migrations
+  like SonarQube's.
+- **Certificates.** The SAN list is hand-maintained in `bin/init_certificate.sh`
+  (on the wip branch) and has to be extended for every new host. HAProxy
+  serves one certificate (`site.pem`). `core` would work out the SAN list from
+  the declared hosts, get the certificate through ACME, reload HAProxy, and warn
+  well before it expires.
+- **Generate and rotate secrets.** `SecretStore::session_secret` (in
+  `init_kanidm_apisix/src/secrets.rs`) already generates its secret when it is
+  missing. `apisix_admin_key` instead fails until someone writes the file by
+  hand, and APISIX reads its own copy of that key from its container
+  environment. Extend the generate-if-missing pattern to every secret, write
+  each one where both Compose (`containers/.env`) and the provisioning code read
+  it, and rotate OAuth2 client secrets through kanidm (`Kanidm::basic_secret`).
+  This retires the APISIX admin key item under "Before merging the wip branch".
+- **Provision on startup, and report drift.** `init_kanidm_apisix` is a separate
+  binary run by hand. Run `run_kanidm_stage`, `run_persons_stage` and
+  `run_apisix_stage` from `core` once `up` succeeds; they are already written to
+  be re-runnable. Also report APISIX routes and kanidm clients that exist but are
+  not declared, which today accumulate silently.
+
+### Operations
+
+- **`core doctor`.** Checks run before startup, and on demand:
+  - Docker and Compose versions (`--wait` needs Compose v2)
+  - the ports HAProxy binds are free
+  - each declared hostname resolves to this machine
+  - the certificate covers every declared host and is not about to expire
+  - every secret file exists
+  - free disk space on the volume store
+
+  Cheap to build, and it catches the failures that are hardest to diagnose
+  after the fact.
+- **`core plan`.** Show what a run would change before it changes anything:
+  `docker compose up --dry-run` for containers, plus the kanidm/APISIX changes
+  the provisioning stages would make. The same idea as `terraform plan`, for
+  this stack.
+- **Postgres-aware backups.** Scheduled `pg_dump` for every database in the
+  `databases` table, plus volume snapshots, sent to the `sftp` service or
+  off-site, with a periodic restore into a scratch container to prove the dumps
+  work. This extends the "volume backup / restore / snapshot hooks" item above.
+- **Admin API.** `web_server` serves only `hello` and `echo`. A `/status`
+  endpoint would report service state (from the Docker events watcher), the
+  `databases` table, certificate expiry and the last backup. Protect it as a
+  `Service` in `api` mode, so APISIX checks a kanidm token. Actions such as
+  restarting a service can come later.
+
+### Outside the machine
+
+- **End-to-end probes.** Regularly request every public hostname through the
+  real path: DNS → TLS → HAProxy → APISIX → the kanidm redirect for `gate`
+  services. This catches broken routes, wrong ACLs and certificate problems that
+  container health never shows, and complements the in-network readiness
+  probes above.
+- **Dynamic DNS.** On a home connection the public IP changes. Update the
+  `BASE_DOMAIN` records through the DNS provider's API when it does, for every
+  declared host.
+- **One notification channel** (ntfy, Telegram or email), shared by crash loops
+  from the events watcher, certificate expiry, failed backups, failed probes and
+  failed `doctor` checks. Build it once, before the features that need it.
+- **Platform audit log on Kafka.** `run_threads` already starts the Kafka
+  producer, but it only carries what `web_server` sends it. Publish platform
+  events to a topic: services provisioned, secrets rotated, containers that
+  crashed, backups taken. That gives a durable history of what changed and
+  when, which the observability stack can consume like any other stream.
 
 ## Actual containers spinned up
 

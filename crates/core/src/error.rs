@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use rdkafka::error::{KafkaError as KafkaErrorFromLibrary, RDKafkaErrorCode};
 
-use crate::docker::DockerModuleError;
+use crate::compose::ComposeError;
 
 #[derive(Debug, Error)]
 pub enum KafkaError {
@@ -26,7 +26,7 @@ pub enum CoreError {
     Configuration(String),
 
     #[error(transparent)]
-    Docker(#[from] DockerModuleError),
+    Compose(#[from] ComposeError),
 
     #[error("Database: {0}")]
     Database(#[from] sqlx::Error),
