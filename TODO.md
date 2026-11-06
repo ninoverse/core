@@ -9,6 +9,82 @@
 > `wip/add-docker-definitions-and-configurations` branch. Items below that
 > speak of services "in the stack" mean that branch.
 
+## Decision: Compose for the platform, k3s for applications
+
+**Platform services** run as Compose services under `core`: HAProxy, kanidm,
+APISIX and etcd, Postgres, the broker, the observability stack, the registry,
+SFTP, and k3s itself. **Applications the owner writes** run in k3s.
+
+`core` does not grow Kubernetes-like features of its own. For applications, k3s
+already provides them: Deployments, probes, rollouts and rollback, CronJobs,
+Secrets. For the platform, the Compose items in this file are enough. This
+changes the scope of other sections:
+
+- **"Beyond Docker Compose" and "Updating the stack without killing it"** now
+  apply to platform services only. Rolling restarts, zero downtime,
+  reconciliation, readiness probes and rollback for applications come from
+  Kubernetes; for the platform they are lower priority.
+- **"Unified service declaration"** covers platform services completely. For a
+  k3s application it covers only what the platform owes it: kanidm client,
+  APISIX route, host, certificate, DNS and database. The workload itself stays
+  in Kubernetes manifests.
+
+### Work this implies
+
+Items marked *unverified* could not be tested here: k3s 1.36 refuses to start
+on a cgroup v1 host, which is what this was checked on.
+
+- **Bring k3s into the Compose project.** Move `standalone/k3s.yaml` into
+  `containers/` and drop its `external` `networks:` block (see "Before merging
+  the wip branch"). Keep `privileged` and the `tmpfs` mounts. Running k3s in
+  Docker rather than on the host keeps one lifecycle under `core`. Revisit if
+  applications need something a containerised node cannot give them.
+- **Give k3s its own datastore.** It uses APISIX's etcd today
+  (`K3S_DATASTORE_ENDPOINT=http://etcd:2379`), so a problem in either one
+  reaches the other. Single-node k3s defaults to embedded SQLite; drop the
+  endpoint and the `etcd-backend` network.
+- **Stop committing the cluster token.** `K3S_TOKEN=my-super-secret-token` is
+  in `k3s.yaml`. Use `${K3S_TOKEN:?…}` from `containers/.env`, generated like
+  the other secrets (see "Generate and rotate secrets").
+- **Leave-running mode becomes a prerequisite.** With k3s in the project,
+  restarting `core` restarts the cluster and every application in it (see
+  "Updating the stack without killing it").
+- **Ingress through APISIX, not a second gateway.** Public traffic for an
+  application goes HAProxy → APISIX → the application, so kanidm gating stays
+  in one place. Disable k3s's bundled Traefik (`--disable traefik`) and expose
+  each application as a Kubernetes `Service` that an APISIX route can reach,
+  e.g. a NodePort on the k3s node container. Each application then gets a
+  `Service` entry in `ServicesConfiguration` whose upstream points into k3s.
+  *Unverified:* the exact upstream address of a NodePort from APISIX's
+  container.
+- **Pods reaching platform services by name.** *Unverified, expected to need
+  work:*
+  - Pods resolve names through CoreDNS, which forwards to the node's
+    `/etc/resolv.conf`. Inside a Docker container that file points at Docker's
+    embedded resolver on `127.0.0.11`, which a pod cannot reach. So `postgres`
+    or `kanidmd` will likely not resolve from a pod.
+  - k3d handles this by writing the host entries into CoreDNS.
+  - Kubernetes `ExternalName` Services are the other route.
+  - The node container must also join `ninoverse-network`. On the wip branch
+    `k3s-agent` is only on `k3s-server-network`.
+- **Pull application images from the platform registry.** `nora` sets
+  `NORA_AUTH_DOCKER_ANON_PULL=false`, so k3s needs a `registries.yaml` with
+  credentials pointing at it. Those credentials are another secret to
+  generate.
+- **Databases and secrets for applications.** "Create a database per service"
+  applies to k3s applications too. Hand the credentials over as Kubernetes
+  Secrets, written by `core` through the API, instead of files in `secrets/`.
+- **Application logs and telemetry.** *Unverified:* pod containers run in k3s's
+  own containerd inside the node container, so Docker, and Vector's Docker log
+  source, should not see them. Either run a log agent in the cluster that
+  forwards to the platform Vector, or have applications send OTLP to Vector
+  directly.
+- **Application deploy flow** (build → push to `nora` → apply). Not decided:
+  `kubectl` or Helm from CI, or GitOps with Flux or Argo CD.
+- **Headlamp** stays as the cluster UI. Generating its kubeconfig (an item on
+  the wip branch's `TODO.md`) is now possible, because `${VAR}` interpolation
+  works under Compose.
+
 ## Compose runner
 
 Symbols named in this section are in `crates/core/src/compose.rs` unless
