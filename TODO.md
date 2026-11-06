@@ -9,81 +9,117 @@
 > `wip/add-docker-definitions-and-configurations` branch. Items below that
 > speak of services "in the stack" mean that branch.
 
-## Decision: Compose for the platform, k3s for applications
+## Decision: k3s for almost everything, Compose for the front door
 
-**Platform services** run as Compose services under `core`: HAProxy, kanidm,
-APISIX and etcd, Postgres, the broker, the observability stack, the registry,
-SFTP, and k3s itself. **Applications the owner writes** run in k3s.
+Most services, and every application the owner writes, run in **k3s,
+installed on the host** under systemd. A small **Compose layer** run by `core`
+keeps what has to work while the cluster is down. The test for what stays out
+of the cluster: *with k3s down, can you still get in, see what is wrong, and
+restore it?* Anything needed for one of those three, or for k3s to start, stays
+in Compose.
 
-`core` does not grow Kubernetes-like features of its own. For applications, k3s
-already provides them: Deployments, probes, rollouts and rollback, CronJobs,
-Secrets. For the platform, the Compose items in this file are enough. This
-changes the scope of other sections:
+`core` does not grow Kubernetes-like features of its own. k3s already provides
+them: Deployments, probes, rollouts and rollback, CronJobs, Secrets,
+operators.
 
-- **"Beyond Docker Compose" and "Updating the stack without killing it"** now
-  apply to platform services only. Rolling restarts, zero downtime,
-  reconciliation, readiness probes and rollback for applications come from
-  Kubernetes; for the platform they are lower priority.
-- **"Unified service declaration"** covers platform services completely. For a
-  k3s application it covers only what the platform owes it: kanidm client,
-  APISIX route, host, certificate, DNS and database. The workload itself stays
-  in Kubernetes manifests.
+### What stays out of the cluster
+
+| Service | Why it stays out |
+|---|---|
+| `core` | It bootstraps the Compose layer and provisions both layers, so it cannot depend on the cluster. |
+| HAProxy | Owns 80/443 and TLS termination. In the cluster, a k3s outage would make everything unreachable, including the tools to fix it. Certificate renewal goes through it too. |
+| kanidm | The root of trust: the k3s API server, Headlamp and every APISIX gate validate its tokens. In the cluster, a broken k3s would take every sign-in with it. |
+| Platform Postgres | `core` connects to it at startup, and its `databases` table is platform state. |
+| Secrets (`secrets/`, `containers/.env`) | Generated on the host by `core`, read by both layers. |
+| A minimal log path: Vector, one log store, Grafana | Monitoring inside the cluster is down exactly when the cluster is the problem. |
+| Backup target | Backups of the cluster cannot live in it. Off-site is better still; SFTP is at most a staging area. |
+
+Kept out by preference, though they could move:
+
+- **APISIX and its etcd.** They gate services that stay out (the `nora` UI, for
+  example), which would go down with the cluster. Treat them as part of the
+  front door with HAProxy and kanidm. Public traffic for applications goes
+  HAProxy → APISIX → application, so kanidm gating stays in one place.
+- **`nora` registry.** In the cluster, rebuilding a node means pulling
+  application images from a registry that is not running yet. That is workable
+  (`nora`'s own image is public), but out is simpler.
+- **Redpanda/Kafka.** `run_threads` starts `core`'s Kafka task once startup is
+  done. Move the broker in only if applications are its only users; otherwise
+  `core`'s run phase depends on the cluster.
+
+### What moves in
+
+- **Headlamp.** It is the cluster's UI. In-cluster it can use `-in-cluster`
+  mode, where its `HEADLAMP_CONFIG_OIDC_*` settings are honored
+  (`docs/headlamp.md` on the wip branch), which should retire the hand-built
+  kubeconfig.
+- **The evaluation backends:** Loki, Tempo, Mimir, OpenObserve, VictoriaLogs.
+  Keep only the minimal log path above in Compose.
+- **SonarQube.**
+- **SigNoz.** Upstream no longer ships Compose files but does publish a Helm
+  chart, so the porting problem in `docs/signoz.md` goes away.
+- **Application databases**, through the CloudNativePG operator, which handles
+  backups and major-version upgrades for them. The platform Postgres stays out
+  and still needs "Postgres-aware backups".
+- **The owner's applications.**
+
+### Scope changes for other sections
+
+- **"Beyond Docker Compose" and "Updating the stack without killing it"** apply
+  to the Compose layer only, which is small and changes rarely. Everything in
+  the cluster gets rollouts, probes and rollback from Kubernetes.
+- **"Unified service declaration"** covers the Compose layer completely. For
+  workloads in the cluster it covers only what the front door owes them:
+  kanidm client, APISIX route, host, certificate, DNS and database. The
+  workload itself is Kubernetes manifests or Helm.
 
 ### Work this implies
 
 Items marked *unverified* could not be tested here: k3s 1.36 refuses to start
 on a cgroup v1 host, which is what this was checked on.
 
-- **Bring k3s into the Compose project.** Move `standalone/k3s.yaml` into
-  `containers/` and drop its `external` `networks:` block (see "Before merging
-  the wip branch"). Keep `privileged` and the `tmpfs` mounts. Running k3s in
-  Docker rather than on the host keeps one lifecycle under `core`. Revisit if
-  applications need something a containerised node cannot give them.
-- **Give k3s its own datastore.** It uses APISIX's etcd today
-  (`K3S_DATASTORE_ENDPOINT=http://etcd:2379`), so a problem in either one
-  reaches the other. Single-node k3s defaults to embedded SQLite; drop the
-  endpoint and the `etcd-backend` network.
+- **Install k3s on the host and retire the Docker-hosted one.** That removes
+  `containers/standalone/k3s.yaml` and `bin/start_k3s.sh` on the wip branch.
+  On the host, k3s's lifecycle is independent of `core`. A `core` restart or a
+  Compose update can no longer bounce the cluster. The cluster's volumes live on
+  the host rather than inside a privileged container's volume.
+- **Use k3s's own datastore.** The wip branch points k3s at APISIX's etcd
+  (`K3S_DATASTORE_ENDPOINT=http://etcd:2379`), so a problem in one reaches the
+  other. Single-node k3s defaults to embedded SQLite.
 - **Stop committing the cluster token.** `K3S_TOKEN=my-super-secret-token` is
-  in `k3s.yaml`. Use `${K3S_TOKEN:?…}` from `containers/.env`, generated like
-  the other secrets (see "Generate and rotate secrets").
-- **Leave-running mode becomes a prerequisite.** With k3s in the project,
-  restarting `core` restarts the cluster and every application in it (see
-  "Updating the stack without killing it").
-- **Ingress through APISIX, not a second gateway.** Public traffic for an
-  application goes HAProxy → APISIX → the application, so kanidm gating stays
-  in one place. Disable k3s's bundled Traefik (`--disable traefik`) and expose
-  each application as a Kubernetes `Service` that an APISIX route can reach,
-  e.g. a NodePort on the k3s node container. Each application then gets a
-  `Service` entry in `ServicesConfiguration` whose upstream points into k3s.
-  *Unverified:* the exact upstream address of a NodePort from APISIX's
-  container.
-- **Pods reaching platform services by name.** *Unverified, expected to need
-  work:*
-  - Pods resolve names through CoreDNS, which forwards to the node's
-    `/etc/resolv.conf`. Inside a Docker container that file points at Docker's
-    embedded resolver on `127.0.0.11`, which a pod cannot reach. So `postgres`
-    or `kanidmd` will likely not resolve from a pod.
-  - k3d handles this by writing the host entries into CoreDNS.
-  - Kubernetes `ExternalName` Services are the other route.
-  - The node container must also join `ninoverse-network`. On the wip branch
-    `k3s-agent` is only on `k3s-server-network`.
-- **Pull application images from the platform registry.** `nora` sets
-  `NORA_AUTH_DOCKER_ANON_PULL=false`, so k3s needs a `registries.yaml` with
-  credentials pointing at it. Those credentials are another secret to
-  generate.
-- **Databases and secrets for applications.** "Create a database per service"
-  applies to k3s applications too. Hand the credentials over as Kubernetes
-  Secrets, written by `core` through the API, instead of files in `secrets/`.
-- **Application logs and telemetry.** *Unverified:* pod containers run in k3s's
-  own containerd inside the node container, so Docker, and Vector's Docker log
-  source, should not see them. Either run a log agent in the cluster that
-  forwards to the platform Vector, or have applications send OTLP to Vector
-  directly.
-- **Application deploy flow** (build → push to `nora` → apply). Not decided:
-  `kubectl` or Helm from CI, or GitOps with Flux or Argo CD.
-- **Headlamp** stays as the cluster UI. Generating its kubeconfig (an item on
-  the wip branch's `TODO.md`) is now possible, because `${VAR}` interpolation
-  works under Compose.
+  in `k3s.yaml`. A host install generates its own token; leave it there.
+- **Keep a break-glass login.** k3s's certificate-based admin kubeconfig does
+  not depend on kanidm. Keep a copy somewhere that survives the host, for when
+  identity or the front door is broken.
+- **Pods reaching the Compose layer.** *Unverified.* Compose service names
+  (`postgres`, `kanidmd`) resolve only inside Docker's networks, not from the
+  host, so they will not resolve from pods either.
+  - Publish the ports pods need on an address pods can reach. HAProxy's
+    `127.0.0.1:5432` is loopback-only and is not one.
+  - Give them in-cluster names with selector-less Services plus Endpoints, or
+    `ExternalName`.
+- **The front door reaching the cluster.** *Unverified.* APISIX runs in Docker
+  and has to reach application Services on the host: a NodePort through
+  Docker's host gateway (`extra_hosts: host.docker.internal:host-gateway`).
+  Disable k3s's bundled Traefik (`--disable traefik`) so APISIX is the only
+  gateway. Each application then gets a `Service` entry in
+  `ServicesConfiguration` whose upstream is that NodePort.
+- **Pulling images from `nora`.** `nora` sets
+  `NORA_AUTH_DOCKER_ANON_PULL=false`, so k3s needs
+  `/etc/rancher/k3s/registries.yaml` with credentials. It also needs a path to
+  `nora` that does not go through a browser sign-in at APISIX.
+- **Credentials for workloads.** Databases and secrets that `core` provisions
+  for a workload in the cluster go in as Kubernetes Secrets through the API,
+  not as files in `secrets/`.
+- **Logs from the cluster.** Pod logs are written under `/var/log/pods` on the
+  host, and Docker does not see them. Either bind-mount that directory into the
+  Compose Vector, or run a log agent in the cluster that forwards to it.
+  *Unverified:* the path for this k3s version.
+- **Moving data.** Each service that moves in brings its named volume with it.
+  Copy each volume into a persistent volume (k3s's local-path provisioner keeps
+  them on the host), or restore from a backup taken just before the move.
+- **Deploy flow** (build → push to `nora` → apply). Not decided: `kubectl` or
+  Helm from CI, or GitOps with Flux or Argo CD.
 
 ## Compose runner
 
@@ -141,10 +177,10 @@ Checked by running `docker compose config` over that branch's
   as `external: true`, which Compose looks up by their literal names. With the
   main stack now creating `ninoverse_etcd-backend`, `bin/start_k3s.sh` fails
   with `network etcd-backend declared as external, but could not be found`
-  (reproduced with a throwaway stack). Either set `name:` on both networks in
-  the main stack, or move `k3s.yaml` into `containers/` and drop its
-  `networks:` block. The move is now possible: Compose supports `privileged`,
-  `tmpfs` and `ulimits`, the gaps that put k3s outside the orchestrator.
+  (reproduced with a throwaway stack). The decision at the top of this file
+  retires the Docker-hosted k3s in favour of a host install. Until that
+  happens, set `name:` on both networks in the main stack to keep
+  `bin/start_k3s.sh` working.
 - **APISIX admin key.** `containers/api_gateway.yaml` still hardcodes `ADMIN_KEY`.
   `init_kanidm_apisix` reads the key from `secrets/APISIX_ADMIN_KEY`
   (`SecretStore::apisix_admin_key` in `init_kanidm_apisix/src/secrets.rs`).
