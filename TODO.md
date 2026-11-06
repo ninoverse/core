@@ -60,6 +60,15 @@ Checked by running `docker compose config` over that branch's
   `name: ninoverse-network` if anything outside the project refers to it by
   name. `etcd-backend`'s `internal: true`, ignored by the old loader, is now
   honored.
+- **The renamed networks break the standalone k3s stack.**
+  `containers/standalone/k3s.yaml` joins `etcd-backend` and `ninoverse-network`
+  as `external: true`, which Compose looks up by their literal names. With the
+  main stack now creating `ninoverse_etcd-backend`, `bin/start_k3s.sh` fails
+  with `network etcd-backend declared as external, but could not be found`
+  (reproduced with a throwaway stack). Either set `name:` on both networks in
+  the main stack, or move `k3s.yaml` into `containers/` and drop its
+  `networks:` block. The move is now possible: Compose supports `privileged`,
+  `tmpfs` and `ulimits`, the gaps that put k3s outside the orchestrator.
 - **APISIX admin key.** `containers/api_gateway.yaml` still hardcodes `ADMIN_KEY`.
   `init_kanidm_apisix` reads the key from `secrets/APISIX_ADMIN_KEY`
   (`SecretStore::apisix_admin_key` in `init_kanidm_apisix/src/secrets.rs`).
