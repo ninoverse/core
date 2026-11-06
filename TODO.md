@@ -189,6 +189,97 @@ label, without `core` owning the compose parser.
   service, with dependency-condition timeouts, before marking deps ready).
 - **Rollback on failed deploy** (keep last-known-good, revert on boot failure).
 
+## Beyond containers: platform ideas
+
+*Proposals, none implemented.* Each item notes what it builds on in the
+current tree. Unless stated otherwise, `ServicesConfiguration`, `Service`,
+`Person` and `ServiceProtectionMode` are in `crates/configuration`, and the
+`run_*_stage` functions are in `crates/init_kanidm_apisix/src/lib.rs`.
+
+### One declaration per service
+
+- **Unified service declaration.** Adding a service today means hand-editing
+  five or six places: its compose file, a Vector sink, an HAProxy host ACL, the
+  certificate SAN list, its `Service` entry (kanidm client and APISIX route), and
+  often SQL migrations for its database (`05`–`07` exist only for SonarQube).
+  `docs/signoz.md` §3 walks through each one. Instead, `core` would drive all
+  of them from a single entry per service: host, upstream, protection mode,
+  whether it needs a database, and whether it emits telemetry. `Service` and
+  `ServiceProtectionMode` already cover the identity and gateway half. Most
+  items below get simpler once this exists, so it comes first.
+
+### Platform services `core` could own
+
+- **Create a database per service.** `sql/02_create_databases_table.sql`
+  creates a `databases` table with a `status` column, but only seed migrations
+  write to it. `core` would create the database and role for each declared
+  service that needs one, generate the password into `secrets/`, and record
+  the result in that table. That replaces hand-written per-service migrations
+  like SonarQube's.
+- **Certificates.** The SAN list is hand-maintained in `bin/init_certificate.sh`
+  (on the wip branch) and has to be extended for every new host. HAProxy
+  serves one certificate (`site.pem`). `core` would work out the SAN list from
+  the declared hosts, get the certificate through ACME, reload HAProxy, and warn
+  well before it expires.
+- **Generate and rotate secrets.** `SecretStore::session_secret` (in
+  `init_kanidm_apisix/src/secrets.rs`) already generates its secret when it is
+  missing. `apisix_admin_key` instead fails until someone writes the file by
+  hand, and APISIX reads its own copy of that key from its container
+  environment. Extend the generate-if-missing pattern to every secret, write
+  each one where both Compose (`containers/.env`) and the provisioning code read
+  it, and rotate OAuth2 client secrets through kanidm (`Kanidm::basic_secret`).
+  This retires the APISIX admin key item under "Before merging the wip branch".
+- **Provision on startup, and report drift.** `init_kanidm_apisix` is a separate
+  binary run by hand. Run `run_kanidm_stage`, `run_persons_stage` and
+  `run_apisix_stage` from `core` once `up` succeeds; they are already written to
+  be re-runnable. Also report APISIX routes and kanidm clients that exist but are
+  not declared, which today accumulate silently.
+
+### Operations
+
+- **`core doctor`.** Checks run before startup, and on demand:
+  - Docker and Compose versions (`--wait` needs Compose v2)
+  - the ports HAProxy binds are free
+  - each declared hostname resolves to this machine
+  - the certificate covers every declared host and is not about to expire
+  - every secret file exists
+  - free disk space on the volume store
+
+  Cheap to build, and it catches the failures that are hardest to diagnose
+  after the fact.
+- **`core plan`.** Show what a run would change before it changes anything:
+  `docker compose up --dry-run` for containers, plus the kanidm/APISIX changes
+  the provisioning stages would make. The same idea as `terraform plan`, for
+  this stack.
+- **Postgres-aware backups.** Scheduled `pg_dump` for every database in the
+  `databases` table, plus volume snapshots, sent to the `sftp` service or
+  off-site, with a periodic restore into a scratch container to prove the dumps
+  work. This extends the "volume backup / restore / snapshot hooks" item above.
+- **Admin API.** `web_server` serves only `hello` and `echo`. A `/status`
+  endpoint would report service state (from the Docker events watcher), the
+  `databases` table, certificate expiry and the last backup. Protect it as a
+  `Service` in `api` mode, so APISIX checks a kanidm token. Actions such as
+  restarting a service can come later.
+
+### Outside the machine
+
+- **End-to-end probes.** Regularly request every public hostname through the
+  real path: DNS → TLS → HAProxy → APISIX → the kanidm redirect for `gate`
+  services. This catches broken routes, wrong ACLs and certificate problems that
+  container health never shows, and complements the in-network readiness
+  probes above.
+- **Dynamic DNS.** On a home connection the public IP changes. Update the
+  `BASE_DOMAIN` records through the DNS provider's API when it does, for every
+  declared host.
+- **One notification channel** (ntfy, Telegram or email), shared by crash loops
+  from the events watcher, certificate expiry, failed backups, failed probes and
+  failed `doctor` checks. Build it once, before the features that need it.
+- **Platform audit log on Kafka.** `run_threads` already starts the Kafka
+  producer, but it only carries what `web_server` sends it. Publish platform
+  events to a topic: services provisioned, secrets rotated, containers that
+  crashed, backups taken. That gives a durable history of what changed and
+  when, which the observability stack can consume like any other stream.
+
 ## Actual containers spinned up
 
 - **Add Signoz**

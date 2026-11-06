@@ -182,8 +182,9 @@ with its own `acl is_signoz` / `use_backend signoz_backend if is_signoz`. This i
 unauthenticated, the same as Grafana is today.
 
 Either way the hostname must be added to the `certbot certonly --expand -d` SAN
-list recorded in [TODO.md](../TODO.md), or TLS for `signoz.nicolapasqualini.it`
-will fail.
+list in `bin/init_certificate.sh` (on the
+`wip/add-docker-definitions-and-configurations` branch, like the compose files),
+and the certificate re-issued, or TLS for `signoz.nicolapasqualini.it` will fail.
 
 ### Conventions to match
 
@@ -291,8 +292,8 @@ originally listed are covered by Compose (§4). Recommended order:
 
 1. Vendor the ClickHouse configs under `containers/config/signoz/`, write
    `containers/signoz.yaml` with `signoz-`-prefixed keys, add the `signoz_out`
-   sink to `config/vector.yaml`, add the HAProxy ACL entry, and record the new
-   hostname in the certbot SAN list.
+   sink to `config/vector.yaml`, add the HAProxy ACL entry, and add the new
+   hostname to the SAN list in `bin/init_certificate.sh`.
 2. Remove the `# signoz:` placeholder from `observability_ui.yaml`.
 
 ### Unrelated, but found while surveying
